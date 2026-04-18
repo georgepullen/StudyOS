@@ -6,7 +6,7 @@ use crate::{
         ContentBlock, HeadingBlock, HintCard, MathBlock, MatrixBlock, ParagraphBlock, QuestionCard,
         RecapBox, WarningBox,
     },
-    widgets::{MatrixGridState, ResponseWidget, ResponseWidgetKind},
+    widgets::{MatrixGridState, ResponseWidget, ResponseWidgetKind, WorkingAnswerState},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,8 +203,8 @@ impl AppSnapshot {
                 sessions_logged: stats.total_sessions,
             },
             plan,
-            transcript: bootstrap_transcript(),
-            widget: ResponseWidget::MatrixGrid(MatrixGridState::new(2, 2)),
+            transcript: bootstrap_transcript(&config.default_course),
+            widget: bootstrap_widget(&config.default_course),
             scratchpad: "Use this scratchpad for rough working that should not be submitted.\n- jot down row operations\n- note shortcuts\n- park reminders".to_string(),
             activity: vec![
                 ActivityItem {
@@ -245,7 +245,28 @@ impl AppSnapshot {
     }
 }
 
-fn bootstrap_transcript() -> Vec<ContentBlock> {
+fn bootstrap_transcript(course: &str) -> Vec<ContentBlock> {
+    if is_probability_course(course) {
+        return probability_bootstrap_transcript();
+    }
+
+    linear_algebra_bootstrap_transcript()
+}
+
+fn bootstrap_widget(course: &str) -> ResponseWidget {
+    if is_probability_course(course) {
+        return ResponseWidget::WorkingAnswer(WorkingAnswerState::default());
+    }
+
+    ResponseWidget::MatrixGrid(MatrixGridState::new(2, 2))
+}
+
+fn is_probability_course(course: &str) -> bool {
+    let normalized = course.to_lowercase();
+    normalized.contains("probability") || normalized.contains("statistics")
+}
+
+fn linear_algebra_bootstrap_transcript() -> Vec<ContentBlock> {
     vec![
         ContentBlock::Heading(HeadingBlock {
             level: 1,
@@ -306,6 +327,70 @@ fn bootstrap_transcript() -> Vec<ContentBlock> {
             prompt: "Outline your working for solving a 2x2 linear system, then give the final solution vector.".to_string(),
             concept_tags: vec!["linear_systems".to_string()],
             widget_kind: ResponseWidgetKind::WorkingAnswer,
+            matrix_dimensions: None,
+        }),
+        ContentBlock::Paragraph(ParagraphBlock {
+            text: "Later iterations will swap these bootstrap cards for app-server generated session plans, question cards, grading feedback, and recaps.".to_string(),
+        }),
+    ]
+}
+
+fn probability_bootstrap_transcript() -> Vec<ContentBlock> {
+    vec![
+        ContentBlock::Heading(HeadingBlock {
+            level: 1,
+            text: "StudyOS V1 Shell".to_string(),
+        }),
+        ContentBlock::Paragraph(ParagraphBlock {
+            text: "This bootstrap view appears while the local tutor runtime connects. Once the first structured Codex turn returns, it replaces this placeholder with live study content.".to_string(),
+        }),
+        ContentBlock::WarningBox(WarningBox {
+            title: "Attempt-First Default".to_string(),
+            body: "Full worked solutions should not appear before the student makes a genuine attempt.".to_string(),
+        }),
+        ContentBlock::MathBlock(MathBlock {
+            latex: "\\mathbb{E}[X] = \\sum_x x p(x), \\qquad \\mathrm{Var}(X)=\\mathbb{E}[X^2]-\\mathbb{E}[X]^2".to_string(),
+            fallback_text: "E[X] = sum x p(x), Var(X) = E[X^2] - (E[X])^2".to_string(),
+        }),
+        ContentBlock::QuestionCard(QuestionCard {
+            title: "Warm-up Expectation Check".to_string(),
+            prompt: "A discrete random variable X takes values 0, 1, 2 with probabilities 0.2, 0.5, 0.3. Show your working for E[X] and Var(X), then give the final pair of values.".to_string(),
+            concept_tags: vec![
+                "expectation".to_string(),
+                "variance".to_string(),
+                "structured_input".to_string(),
+            ],
+            widget_kind: ResponseWidgetKind::WorkingAnswer,
+            matrix_dimensions: None,
+        }),
+        ContentBlock::HintCard(HintCard {
+            title: "Hint".to_string(),
+            body: "Compute E[X] first, then E[X^2], and only then subtract (E[X])^2."
+                .to_string(),
+        }),
+        ContentBlock::RecapBox(RecapBox {
+            title: "End-of-session target".to_string(),
+            highlights: vec![
+                "log at least one structured stats attempt".to_string(),
+                "persist the session to SQLite".to_string(),
+                "prepare the next retrieval review".to_string(),
+            ],
+        }),
+        ContentBlock::Paragraph(ParagraphBlock {
+            text: "Use the panel tabs to inspect the session plan, deadlines, or scratchpad while the shell is still local-only.".to_string(),
+        }),
+        ContentBlock::QuestionCard(QuestionCard {
+            title: "Interpretation Check".to_string(),
+            prompt: "In one sentence, explain what it means if two variables have covariance 0.".to_string(),
+            concept_tags: vec!["covariance".to_string(), "interpretation".to_string()],
+            widget_kind: ResponseWidgetKind::RetrievalResponse,
+            matrix_dimensions: None,
+        }),
+        ContentBlock::QuestionCard(QuestionCard {
+            title: "Method-mark Prompt".to_string(),
+            prompt: "List the steps for standardising a normal random variable before reading a z-table.".to_string(),
+            concept_tags: vec!["normal_distribution".to_string(), "standardisation".to_string()],
+            widget_kind: ResponseWidgetKind::StepList,
             matrix_dimensions: None,
         }),
         ContentBlock::Paragraph(ParagraphBlock {
@@ -517,6 +602,37 @@ mod tests {
         assert_eq!(
             snapshot.plan.warm_up_questions[0],
             "Rebuild the inner-dimension rule for matrix multiplication."
+        );
+    }
+
+    #[test]
+    fn bootstrap_transcript_matches_probability_course() {
+        let config = AppConfig {
+            default_course: "Probability & Statistics for Scientists".to_string(),
+            ..AppConfig::default()
+        };
+        let snapshot =
+            AppSnapshot::bootstrap(&config, &stats(0, 0, 0), &BootstrapStudyContext::default());
+
+        assert!(matches!(
+            snapshot.widget,
+            ResponseWidget::WorkingAnswer(WorkingAnswerState { .. })
+        ));
+        let first_question = snapshot
+            .transcript
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::QuestionCard(card) => Some(card),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("probability bootstrap should include a question card"));
+
+        assert!(first_question.title.contains("Expectation"));
+        assert!(
+            first_question
+                .concept_tags
+                .iter()
+                .any(|tag| tag == "expectation")
         );
     }
 }
