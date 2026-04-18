@@ -92,7 +92,8 @@ This repository now has the first end-to-end tutor loop wired up:
 4. request a schema-constrained opening study step
 5. render the returned teaching blocks and structured question
 6. submit a structured answer for grading and the next question
-7. persist local resume state, session records, attempts, and misconceptions in SQLite
+7. review a compact recap before closing the session
+8. persist local resume state, session records, attempts, misconceptions, and session recaps in SQLite
 
 Detailed V1 implementation docs live in:
 
@@ -113,7 +114,7 @@ cargo run -p studyos-cli
 
 Useful keys:
 
-- `q` safe exit
+- `q` open recap review, then confirm safe exit
 - `tab` cycle focus regions
 - `1` to `6` switch side panels
 - `[` and `]` jump between active questions

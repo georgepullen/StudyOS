@@ -77,6 +77,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 
     if app.show_help {
         render_help_overlay(frame, app);
+    } else if let Some(recap) = app.quit_recap_preview() {
+        render_quit_overlay(frame, app, recap);
     }
 }
 
@@ -89,10 +91,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(
-            app.snapshot.mode.label(),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled(app.current_mode_label(), Style::default().fg(Color::Yellow)),
         Span::raw("  "),
         Span::raw(&app.snapshot.course),
     ]);
@@ -488,7 +487,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, app: &App) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("q        safe quit"),
+        Line::from("q        open recap review / confirm quit"),
         Line::from("tab      cycle focus"),
         Line::from("?        toggle this help"),
         Line::from("1..6     switch side panel tabs"),
@@ -508,6 +507,92 @@ fn render_help_overlay(frame: &mut Frame<'_>, app: &App) {
 
     let overlay = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("Help"))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(overlay, area);
+}
+
+fn render_quit_overlay(
+    frame: &mut Frame<'_>,
+    app: &App,
+    recap: &studyos_core::SessionRecapSummary,
+) {
+    let area = centered_rect(72, 76, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Session recap before exit",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Outcome",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(recap.outcome_summary.clone()),
+    ];
+
+    if !recap.demonstrated_concepts.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Demonstrated",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for item in &recap.demonstrated_concepts {
+            lines.push(Line::from(format!("• {item}")));
+        }
+    }
+
+    if !recap.weak_concepts.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Still weak",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        for item in &recap.weak_concepts {
+            lines.push(Line::from(format!("• {item}")));
+        }
+    }
+
+    if !recap.next_review_items.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Next review",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for item in &recap.next_review_items {
+            lines.push(Line::from(format!("• {item}")));
+        }
+    }
+
+    if !recap.unfinished_objectives.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Restart from",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for item in &recap.unfinished_objectives {
+            lines.push(Line::from(format!("• {item}")));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "Press q or Enter to save and quit {}. Press Esc to keep studying.",
+        app.snapshot.course
+    )));
+
+    let overlay = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Exit Review"))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(overlay, area);

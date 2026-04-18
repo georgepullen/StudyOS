@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -9,11 +9,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Value, json};
 use studyos_core::{
     ActivityItem, ActivityStatus, AppConfig, AppDatabase, AppPaths, AppSnapshot, AppStats,
-    AttemptRecord, ContentBlock, LocalContext, MatrixGridState,
-    MisconceptionInput, PanelTab, ResponseWidget, ResponseWidgetKind, ResumeStateRecord,
-    RetrievalResponseState, SessionMode, SessionRecord, StepListState, TutorCorrectness,
-    TutorErrorType, TutorEvaluation, TutorReasoningQuality, TutorTurnPayload, WarningBox,
-    WorkingAnswerState,
+    AttemptRecord, ContentBlock, LocalContext, MatrixGridState, MisconceptionInput, PanelTab,
+    ResponseWidget, ResponseWidgetKind, ResumeStateRecord, RetrievalResponseState, SessionMode,
+    SessionRecapRecord, SessionRecapSummary, SessionRecord, StepListState, TutorCorrectness,
+    TutorErrorType, TutorEvaluation, TutorReasoningQuality, TutorSessionClosePayload,
+    TutorTurnPayload, WarningBox, WorkingAnswerState,
 };
 
 use crate::runtime::{AppServerClient, RuntimeEvent};
@@ -103,6 +103,7 @@ pub struct App {
     session_started_at: Instant,
     session_finished: bool,
     session_outcomes: Vec<String>,
+    quit_recap_preview: Option<SessionRecapSummary>,
 }
 
 impl App {
@@ -164,6 +165,7 @@ impl App {
             session_started_at: Instant::now(),
             session_finished: false,
             session_outcomes: Vec::new(),
+            quit_recap_preview: None,
         };
 
         if let Some(resume) = resume_state {
@@ -289,9 +291,27 @@ impl App {
             return None;
         }
 
+        if self.quit_recap_preview.is_some() {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Enter => {
+                    self.should_quit = true;
+                }
+                KeyCode::Esc => {
+                    self.quit_recap_preview = None;
+                    self.set_activity(
+                        "Session close",
+                        "Returned to the active study session without closing.".to_string(),
+                        ActivityStatus::Healthy,
+                    );
+                }
+                _ => {}
+            }
+            return None;
+        }
+
         match key.code {
             KeyCode::Char('q') => {
-                self.should_quit = true;
+                self.open_quit_recap_review();
                 return None;
             }
             KeyCode::Char('?') => {
@@ -366,11 +386,18 @@ impl App {
         }
 
         let actual_minutes = (self.session_started_at.elapsed().as_secs() / 60) as i64;
-        let outcome_summary = if self.session_outcomes.is_empty() {
-            "Session ended before any graded evidence was captured.".to_string()
-        } else {
-            self.session_outcomes.join(" | ")
+        let recap = match self.generate_session_recap() {
+            Ok(recap) => recap,
+            Err(error) => {
+                self.set_activity(
+                    "App-server",
+                    format!("Close recap fell back to local summary: {error}"),
+                    ActivityStatus::Idle,
+                );
+                self.fallback_session_recap()
+            }
         };
+        let outcome_summary = recap.outcome_summary.clone();
 
         self.database.complete_session(
             &self.current_session_id,
@@ -378,6 +405,10 @@ impl App {
             &outcome_summary,
             None,
         )?;
+        self.database.save_session_recap(&SessionRecapRecord {
+            session_id: self.current_session_id.clone(),
+            recap,
+        })?;
         self.session_finished = true;
         self.refresh_snapshot_metrics()?;
         self.persist_resume_state()?;
@@ -386,6 +417,18 @@ impl App {
 
     pub fn active_widget(&self) -> Option<&ResponseWidget> {
         self.widget_states.get(&self.active_question_index)
+    }
+
+    pub fn quit_recap_preview(&self) -> Option<&SessionRecapSummary> {
+        self.quit_recap_preview.as_ref()
+    }
+
+    pub fn current_mode_label(&self) -> &'static str {
+        if self.quit_recap_preview.is_some() {
+            SessionMode::Recap.label()
+        } else {
+            self.snapshot.mode.label()
+        }
     }
 
     pub fn active_widget_mut(&mut self) -> Option<&mut ResponseWidget> {
@@ -445,9 +488,14 @@ impl App {
         } else {
             "Local fallback"
         };
+        let quit_label = if self.quit_recap_preview.is_some() {
+            " | Quit review open"
+        } else {
+            ""
+        };
 
         format!(
-            "Focus: {} | Panel: {} | Strictness: {:?} | Sessions: {} | Attempts: {} | Runtime thread: {} | {}",
+            "Focus: {} | Panel: {} | Strictness: {:?} | Sessions: {} | Attempts: {} | Runtime thread: {} | {}{}",
             self.focus.label(),
             self.snapshot.panel_tab.label(),
             self.config.strictness,
@@ -455,6 +503,7 @@ impl App {
             self.stats.total_attempts,
             self.runtime_thread_id.as_deref().unwrap_or("not-started"),
             runtime_label,
+            quit_label,
         )
     }
 
@@ -538,6 +587,71 @@ impl App {
     fn execute_action_inner(&mut self, action: AppAction) -> Result<()> {
         match action {
             AppAction::SubmitCurrentAnswer => self.submit_current_answer(),
+        }
+    }
+
+    fn generate_session_recap(&self) -> Result<SessionRecapSummary> {
+        if !self.pending_structured_turns.is_empty() {
+            return Ok(self.fallback_session_recap());
+        }
+
+        let Some(runtime) = &self.runtime else {
+            return Ok(self.fallback_session_recap());
+        };
+        let Some(thread_id) = &self.runtime_thread_id else {
+            return Ok(self.fallback_session_recap());
+        };
+
+        let cwd = self.paths.root_dir.parent().unwrap_or(&self.paths.root_dir);
+        let prompt = self.build_close_prompt();
+        let raw = runtime.run_structured_turn_and_wait(
+            thread_id,
+            &prompt,
+            tutor_close_output_schema(),
+            cwd,
+            Duration::from_secs(45),
+        )?;
+        let payload = serde_json::from_str::<TutorSessionClosePayload>(&raw)?;
+        Ok(payload.recap)
+    }
+
+    fn fallback_session_recap(&self) -> SessionRecapSummary {
+        let mut weak_concepts = self
+            .database
+            .list_recent_misconceptions(3)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| item.concept_name)
+            .collect::<Vec<_>>();
+        weak_concepts.dedup();
+
+        let unfinished_objectives = match self.active_question_prompt() {
+            Some(prompt) if !prompt.trim().is_empty() => vec![prompt],
+            _ => Vec::new(),
+        };
+
+        SessionRecapSummary {
+            outcome_summary: if self.session_outcomes.is_empty() {
+                "Session ended before any graded evidence was captured.".to_string()
+            } else {
+                self.session_outcomes.join(" | ")
+            },
+            demonstrated_concepts: self
+                .database
+                .list_due_reviews(3)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| item.concept_name)
+                .collect(),
+            weak_concepts,
+            next_review_items: self
+                .database
+                .list_due_reviews(3)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| format!("{} at {}", item.concept_name, item.next_review_at))
+                .collect(),
+            unfinished_objectives,
         }
     }
 
@@ -710,6 +824,72 @@ impl App {
         )
     }
 
+    fn build_close_prompt(&self) -> String {
+        let evidence = if self.session_outcomes.is_empty() {
+            "No graded outcomes were captured in this session.".to_string()
+        } else {
+            self.session_outcomes.join(" | ")
+        };
+        let due_reviews = self
+            .database
+            .list_due_reviews(4)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| format!("{} due {}", item.concept_name, item.next_review_at))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let misconceptions = self
+            .database
+            .list_recent_misconceptions(4)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| {
+                format!(
+                    "{} [{}]: {}",
+                    item.concept_name, item.error_type, item.description
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let unfinished = self
+            .active_question_prompt()
+            .unwrap_or_else(|| "No active question remained open.".to_string());
+
+        format!(
+            "Return JSON matching the provided schema only.\n\
+            Close this StudyOS session with a concise recap.\n\
+            Session mode: {}\n\
+            Course: {}\n\
+            Session minutes planned: {}\n\
+            Evidence captured this session: {}\n\
+            Due reviews now: {}\n\
+            Recent misconceptions: {}\n\
+            If the session stopped with unfinished work, carry it into unfinished_objectives: {}\n\
+            Requirements:\n\
+            - produce recap only, not a new question\n\
+            - outcome_summary should describe demonstrated progress honestly\n\
+            - demonstrated_concepts should be concepts that were actually shown, not wishful goals\n\
+            - weak_concepts should name unresolved or fragile areas\n\
+            - next_review_items should be actionable and short\n\
+            - unfinished_objectives should be concrete restart points for the next launch",
+            self.snapshot.mode.label(),
+            self.snapshot.course,
+            self.snapshot.time_remaining_minutes,
+            evidence,
+            if due_reviews.is_empty() {
+                "none".to_string()
+            } else {
+                due_reviews
+            },
+            if misconceptions.is_empty() {
+                "none".to_string()
+            } else {
+                misconceptions
+            },
+            unfinished,
+        )
+    }
+
     fn widget_submission_summary(&self) -> String {
         match self.active_widget() {
             Some(ResponseWidget::MatrixGrid(state)) => {
@@ -757,6 +937,17 @@ impl App {
             }
             None => "widget: none\nNo active widget state.".to_string(),
         }
+    }
+
+    fn open_quit_recap_review(&mut self) {
+        let recap = self.fallback_session_recap();
+        self.quit_recap_preview = Some(recap);
+        self.set_activity(
+            "Session close",
+            "Recap preview opened. Press q or Enter to save and quit, or Esc to keep studying."
+                .to_string(),
+            ActivityStatus::Running,
+        );
     }
 
     fn build_pending_attempt_context(&self) -> PendingAttemptContext {
@@ -1664,10 +1855,39 @@ fn tutor_recap_block_schema() -> Value {
     })
 }
 
+fn tutor_close_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "recap": {
+                "type": "object",
+                "properties": {
+                    "outcome_summary": { "type": "string" },
+                    "demonstrated_concepts": { "type": "array", "items": { "type": "string" } },
+                    "weak_concepts": { "type": "array", "items": { "type": "string" } },
+                    "next_review_items": { "type": "array", "items": { "type": "string" } },
+                    "unfinished_objectives": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": [
+                    "outcome_summary",
+                    "demonstrated_concepts",
+                    "weak_concepts",
+                    "next_review_items",
+                    "unfinished_objectives"
+                ],
+                "additionalProperties": false
+            }
+        },
+        "required": ["recap"],
+        "additionalProperties": false
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{env, fs};
 
+    use crossterm::event::{KeyCode, KeyEvent};
     use studyos_core::{
         AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, LocalContext,
         ResponseWidget, ResponseWidgetKind, SessionPlanSummary, TutorBlock, TutorCorrectness,
@@ -1780,6 +2000,56 @@ mod tests {
             misconceptions[0].error_type,
             "conceptual_misunderstanding".to_string()
         );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn quit_review_opens_before_exit_and_can_be_cancelled() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+
+        let mut app = App::new(AppBootstrap {
+            database,
+            paths: paths.clone(),
+            config,
+            stats,
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: None,
+            runtime_error: None,
+            resume_state: None,
+        });
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('q')));
+
+        assert!(!app.should_quit);
+        assert_eq!(app.current_mode_label(), "Recap");
+        let recap = app
+            .quit_recap_preview()
+            .unwrap_or_else(|| panic!("quit recap preview should be open"));
+        assert!(
+            recap
+                .outcome_summary
+                .contains("Session ended before any graded evidence")
+        );
+        assert_eq!(recap.unfinished_objectives.len(), 1);
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+
+        assert!(app.quit_recap_preview().is_none());
+        assert_eq!(app.current_mode_label(), "Study");
+        assert!(!app.should_quit);
 
         let _ = fs::remove_dir_all(base);
     }

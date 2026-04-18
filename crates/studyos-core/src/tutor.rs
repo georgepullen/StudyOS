@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ContentBlock, HintCard, MathBlock, MatrixBlock, ParagraphBlock, QuestionCard, RecapBox,
-    ResponseWidgetKind, SessionPlanSummary, WarningBox,
+    ResponseWidgetKind, SessionPlanSummary, SessionRecapSummary, WarningBox,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +93,11 @@ pub struct TutorTurnPayload {
     pub teaching_blocks: Vec<TutorBlock>,
     pub question: Option<TutorQuestion>,
     pub evaluation: Option<TutorEvaluation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TutorSessionClosePayload {
+    pub recap: SessionRecapSummary,
 }
 
 impl TutorTurnPayload {

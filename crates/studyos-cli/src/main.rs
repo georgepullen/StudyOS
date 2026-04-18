@@ -51,6 +51,7 @@ fn run_interactive(paths: &AppPaths) -> Result<()> {
                 description: item.description,
             })
             .collect(),
+        last_session_recap: database.latest_session_recap()?,
     };
     let snapshot = AppSnapshot::bootstrap(&config, &stats, &startup_context);
     let (runtime, runtime_error) = match AppServerClient::spawn() {
@@ -136,6 +137,7 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
                 description: item.description,
             })
             .collect(),
+        last_session_recap: database.latest_session_recap()?,
     };
     let snapshot = AppSnapshot::bootstrap(&config, &stats, &startup_context);
     let app_server = match AppServerClient::spawn() {

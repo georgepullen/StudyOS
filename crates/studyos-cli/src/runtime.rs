@@ -187,6 +187,73 @@ impl AppServerClient {
         events
     }
 
+    pub fn run_structured_turn_and_wait(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        output_schema: Value,
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<String> {
+        let turn_id = self.start_structured_turn(thread_id, prompt, output_schema, cwd)?;
+        let started_at = std::time::Instant::now();
+        let mut text_buffers: HashMap<String, String> = HashMap::new();
+        let mut completed_text: Option<String> = None;
+
+        while started_at.elapsed() < timeout {
+            let remaining = timeout.saturating_sub(started_at.elapsed());
+            let event = self
+                .events
+                .recv_timeout(remaining.min(Duration::from_secs(1)))
+                .map_err(|_| anyhow!("timed out waiting for structured turn completion"))?;
+
+            match event {
+                RuntimeEvent::AgentMessageDelta {
+                    turn_id: event_turn_id,
+                    item_id,
+                    delta,
+                } if event_turn_id == turn_id => {
+                    text_buffers.entry(item_id).or_default().push_str(&delta);
+                }
+                RuntimeEvent::ItemCompleted {
+                    turn_id: event_turn_id,
+                    item,
+                } if event_turn_id == turn_id
+                    && item.get("type").and_then(Value::as_str) == Some("agentMessage") =>
+                {
+                    let item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let fallback = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    completed_text = Some(text_buffers.remove(&item_id).unwrap_or(fallback));
+                }
+                RuntimeEvent::TurnCompleted {
+                    turn_id: event_turn_id,
+                    status,
+                } if event_turn_id == turn_id => {
+                    if status == "failed" {
+                        return Err(anyhow!("structured turn {turn_id} failed"));
+                    }
+                    if let Some(text) = completed_text {
+                        return Ok(text);
+                    }
+                }
+                RuntimeEvent::Error { message } => {
+                    return Err(anyhow!(message));
+                }
+                _ => {}
+            }
+        }
+
+        Err(anyhow!("timed out waiting for structured turn payload"))
+    }
+
     fn send_request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();

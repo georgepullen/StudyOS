@@ -97,6 +97,15 @@ pub struct SessionPlanSummary {
     pub stretch_target: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SessionRecapSummary {
+    pub outcome_summary: String,
+    pub demonstrated_concepts: Vec<String>,
+    pub weak_concepts: Vec<String>,
+    pub next_review_items: Vec<String>,
+    pub unfinished_objectives: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StartupReviewItem {
     pub concept_name: String,
@@ -113,6 +122,7 @@ pub struct StartupMisconceptionItem {
 pub struct BootstrapStudyContext {
     pub due_reviews: Vec<StartupReviewItem>,
     pub recent_misconceptions: Vec<StartupMisconceptionItem>,
+    pub last_session_recap: Option<SessionRecapSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,7 +395,20 @@ fn build_start_plan(
         },
         _ => SessionPlanSummary {
             recommended_duration_minutes: config.default_session_minutes,
-            why_now: if stats.due_reviews > 0 {
+            why_now: if let Some(recap) = &study_context.last_session_recap {
+                if let Some(objective) = recap.unfinished_objectives.first() {
+                    format!(
+                        "Last session ended with unfinished work, so restart by stabilizing: {}.",
+                        objective
+                    )
+                } else if stats.due_reviews > 0 {
+                    "You have some memory pressure, but not enough to force a full review block, so start with retrieval and then progress."
+                        .to_string()
+                } else {
+                    "No urgent repair queue yet, so this session should establish or extend fluent understanding with retrieval-first warmups."
+                        .to_string()
+                }
+            } else if stats.due_reviews > 0 {
                 "You have some memory pressure, but not enough to force a full review block, so start with retrieval and then progress."
                     .to_string()
             } else {
@@ -393,14 +416,28 @@ fn build_start_plan(
                     .to_string()
             },
             warm_up_questions: vec![
-                "State the condition for matrix multiplication dimensions.".to_string(),
+                study_context
+                    .last_session_recap
+                    .as_ref()
+                    .and_then(|recap| recap.unfinished_objectives.first().cloned())
+                    .unwrap_or_else(|| {
+                        "State the condition for matrix multiplication dimensions.".to_string()
+                    }),
                 "Explain what a singular matrix tells you about invertibility.".to_string(),
             ],
             core_targets: vec![
                 "Matrix multiplication fluency".to_string(),
                 "Reasoning about invertibility".to_string(),
             ],
-            stretch_target: Some("Connect determinant zero to linear dependence.".to_string()),
+            stretch_target: Some(
+                study_context
+                    .last_session_recap
+                    .as_ref()
+                    .and_then(|recap| recap.unfinished_objectives.first().cloned())
+                    .unwrap_or_else(|| {
+                        "Connect determinant zero to linear dependence.".to_string()
+                    }),
+            ),
         },
     }
 }
@@ -430,6 +467,7 @@ mod tests {
                     concept_name: "Matrix multiplication dimensions".to_string(),
                 }],
                 recent_misconceptions: Vec::new(),
+                last_session_recap: None,
             },
         );
 
@@ -445,5 +483,37 @@ mod tests {
 
         assert_eq!(snapshot.mode, SessionMode::Drill);
         assert_eq!(snapshot.panel_tab, PanelTab::Deadlines);
+    }
+
+    #[test]
+    fn bootstrap_uses_unfinished_objectives_from_last_session() {
+        let config = AppConfig::default();
+        let snapshot = AppSnapshot::bootstrap(
+            &config,
+            &stats(0, 0, 1),
+            &BootstrapStudyContext {
+                due_reviews: Vec::new(),
+                recent_misconceptions: Vec::new(),
+                last_session_recap: Some(SessionRecapSummary {
+                    outcome_summary: "Stopped mid repair.".to_string(),
+                    demonstrated_concepts: Vec::new(),
+                    weak_concepts: vec!["Matrix multiplication".to_string()],
+                    next_review_items: Vec::new(),
+                    unfinished_objectives: vec![
+                        "Rebuild the inner-dimension rule for matrix multiplication.".to_string(),
+                    ],
+                }),
+            },
+        );
+
+        assert_eq!(snapshot.mode, SessionMode::Study);
+        assert!(
+            snapshot.plan.why_now.contains("unfinished work"),
+            "expected why_now to mention unfinished work"
+        );
+        assert_eq!(
+            snapshot.plan.warm_up_questions[0],
+            "Rebuild the inner-dimension rule for matrix multiplication."
+        );
     }
 }

@@ -7,6 +7,8 @@ use std::{
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::SessionRecapSummary;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppStats {
     pub due_reviews: usize,
@@ -68,6 +70,12 @@ pub struct MisconceptionSummary {
     pub description: String,
     pub last_seen_at: String,
     pub evidence_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecapRecord {
+    pub session_id: String,
+    pub recap: SessionRecapSummary,
 }
 
 pub struct AppDatabase {
@@ -187,6 +195,23 @@ impl AppDatabase {
             WHERE id = ?1
             ",
             params![session_id, actual_minutes, outcome_summary, aborted_reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_session_recap(&self, record: &SessionRecapRecord) -> Result<()> {
+        self.connection.execute(
+            "
+            UPDATE sessions
+            SET outcome_summary = ?2,
+                recap_payload = ?3
+            WHERE id = ?1
+            ",
+            params![
+                record.session_id,
+                record.recap.outcome_summary,
+                serde_json::to_string(&record.recap)?,
+            ],
         )?;
         Ok(())
     }
@@ -314,6 +339,27 @@ impl AppDatabase {
             summaries.push(row?);
         }
         Ok(summaries)
+    }
+
+    pub fn latest_session_recap(&self) -> Result<Option<SessionRecapSummary>> {
+        let recap = self
+            .connection
+            .query_row(
+                "
+                SELECT recap_payload
+                FROM sessions
+                WHERE recap_payload IS NOT NULL AND recap_payload != ''
+                ORDER BY started_at DESC
+                LIMIT 1
+                ",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        recap
+            .map(|raw| serde_json::from_str::<SessionRecapSummary>(&raw).map_err(Into::into))
+            .transpose()
     }
 
     fn count_query(&self, sql: &str) -> Result<usize> {
@@ -520,7 +566,8 @@ impl AppDatabase {
                 actual_minutes INTEGER,
                 mode TEXT NOT NULL,
                 outcome_summary TEXT NOT NULL DEFAULT '',
-                aborted_reason TEXT
+                aborted_reason TEXT,
+                recap_payload TEXT
             );
 
             CREATE TABLE IF NOT EXISTS deadlines (
@@ -547,6 +594,7 @@ impl AppDatabase {
         )?;
 
         self.migrate_resume_state()?;
+        self.migrate_sessions_recap_payload()?;
         self.seed_default_concepts()?;
         Ok(())
     }
@@ -567,6 +615,25 @@ impl AppDatabase {
                 "ALTER TABLE resume_state ADD COLUMN runtime_thread_id TEXT",
                 [],
             )?;
+        }
+
+        Ok(())
+    }
+
+    fn migrate_sessions_recap_payload(&self) -> Result<()> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(sessions)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        let mut has_recap_payload = false;
+
+        for column in columns {
+            if column? == "recap_payload" {
+                has_recap_payload = true;
+            }
+        }
+
+        if !has_recap_payload {
+            self.connection
+                .execute("ALTER TABLE sessions ADD COLUMN recap_payload TEXT", [])?;
         }
 
         Ok(())
@@ -628,7 +695,12 @@ fn clamp(value: f64, min: f64, max: f64) -> f64 {
 mod tests {
     use std::{env, fs};
 
-    use super::{AppDatabase, AttemptRecord, MisconceptionInput, ResumeStateRecord, SessionRecord};
+    use crate::SessionRecapSummary;
+
+    use super::{
+        AppDatabase, AttemptRecord, MisconceptionInput, ResumeStateRecord, SessionRecapRecord,
+        SessionRecord,
+    };
 
     fn temp_db_dir() -> std::path::PathBuf {
         let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -753,6 +825,50 @@ mod tests {
                 misconceptions[0].error_type,
                 "conceptual_misunderstanding".to_string()
             );
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn session_recap_round_trips() {
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        {
+            let database = AppDatabase::open(&path)
+                .unwrap_or_else(|err| panic!("database open failed: {err}"));
+
+            database
+                .start_session(&SessionRecord {
+                    id: "session-recap".to_string(),
+                    planned_minutes: 30,
+                    mode: "Study".to_string(),
+                })
+                .unwrap_or_else(|err| panic!("session start failed: {err}"));
+
+            let recap = SessionRecapSummary {
+                outcome_summary: "Recovered the matrix product rule.".to_string(),
+                demonstrated_concepts: vec!["Matrix multiplication dimensions".to_string()],
+                weak_concepts: vec!["Explaining why rows dot beta".to_string()],
+                next_review_items: vec!["Revisit matrix-vector products tomorrow".to_string()],
+                unfinished_objectives: vec![
+                    "Explain why each entry of X beta is a row dot product.".to_string(),
+                ],
+            };
+
+            database
+                .save_session_recap(&SessionRecapRecord {
+                    session_id: "session-recap".to_string(),
+                    recap: recap.clone(),
+                })
+                .unwrap_or_else(|err| panic!("save recap failed: {err}"));
+
+            let loaded = database
+                .latest_session_recap()
+                .unwrap_or_else(|err| panic!("load recap failed: {err}"))
+                .unwrap_or_else(|| panic!("missing recap"));
+
+            assert_eq!(loaded, recap);
         }
 
         let _ = fs::remove_dir_all(dir);

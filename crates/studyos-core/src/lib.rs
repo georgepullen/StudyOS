@@ -16,16 +16,16 @@ pub use course::{ConceptDefinition, CourseCatalog, CourseDefinition, TopicDefini
 pub use local_data::{DeadlineEntry, LocalContext, MaterialEntry, TimetableData, TimetableSlot};
 pub use session::{
     ActivityItem, ActivityStatus, AppSnapshot, BootstrapStudyContext, DeadlineUrgency,
-    KeybindingHint, PanelTab, SessionMetrics, SessionMode, SessionPlanSummary,
+    KeybindingHint, PanelTab, SessionMetrics, SessionMode, SessionPlanSummary, SessionRecapSummary,
     StartupMisconceptionItem, StartupReviewItem,
 };
 pub use store::{
     AppDatabase, AppStats, AttemptRecord, DueReviewSummary, MisconceptionInput,
-    MisconceptionSummary, ResumeStateRecord, SessionRecord,
+    MisconceptionSummary, ResumeStateRecord, SessionRecapRecord, SessionRecord,
 };
 pub use tutor::{
     TutorBlock, TutorCorrectness, TutorErrorType, TutorEvaluation, TutorMisconception,
-    TutorQuestion, TutorReasoningQuality, TutorTurnPayload,
+    TutorQuestion, TutorReasoningQuality, TutorSessionClosePayload, TutorTurnPayload,
 };
 pub use widgets::{
     MatrixDimensions, MatrixGridState, ResponseWidget, ResponseWidgetKind, RetrievalResponseState,
