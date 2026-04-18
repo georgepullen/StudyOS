@@ -55,8 +55,7 @@ impl LocalContext {
         let deadlines = load_deadlines(&paths.deadlines_path)?;
         let timetable = load_json_file::<TimetableData>(&paths.timetable_path)?;
         let materials_manifest = paths.materials_dir.join("manifest.json");
-        let materials =
-            load_json_file::<Vec<MaterialEntry>>(&materials_manifest)?.unwrap_or_default();
+        let materials = load_materials(&materials_manifest)?;
         let courses = CourseCatalog::load(&paths.courses_dir)?;
 
         Ok(Self {
@@ -77,6 +76,66 @@ impl LocalContext {
                     .unwrap_or(true)
             })
             .count()
+    }
+
+    pub fn search_materials(
+        &self,
+        course_filter: Option<&str>,
+        terms: &[String],
+        limit: usize,
+    ) -> Vec<MaterialEntry> {
+        let normalized_terms = terms
+            .iter()
+            .map(|term| term.trim().to_lowercase())
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>();
+
+        let mut scored = self
+            .materials
+            .iter()
+            .filter_map(|entry| {
+                let course_matches = course_filter
+                    .map(|course| entry.course.eq_ignore_ascii_case(course))
+                    .unwrap_or(true);
+                if !course_matches {
+                    return None;
+                }
+
+                let haystack = format!(
+                    "{} {} {} {}",
+                    entry.title,
+                    entry.snippet,
+                    entry.material_type,
+                    entry.topic_tags.join(" ")
+                )
+                .to_lowercase();
+
+                let mut score = if course_filter.is_some() { 2 } else { 0 };
+                if normalized_terms.is_empty() {
+                    score += 1;
+                } else {
+                    for term in &normalized_terms {
+                        if haystack.contains(term) {
+                            score += 2;
+                        }
+                    }
+                }
+
+                (score > 0).then(|| (score, entry.clone()))
+            })
+            .collect::<Vec<_>>();
+
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.title.cmp(&right.1.title))
+        });
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, entry)| entry)
+            .collect()
     }
 }
 
@@ -109,6 +168,12 @@ pub fn upsert_deadline(path: &Path, entry: DeadlineEntry) -> Result<Vec<Deadline
     }
     save_deadlines(path, &deadlines)?;
     Ok(deadlines)
+}
+
+pub fn load_materials(path: &Path) -> Result<Vec<MaterialEntry>> {
+    let mut materials = load_json_file::<Vec<MaterialEntry>>(path)?.unwrap_or_default();
+    materials.sort_by(|left, right| left.title.cmp(&right.title));
+    Ok(materials)
 }
 
 fn load_json_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -203,5 +268,43 @@ mod tests {
         };
 
         assert_eq!(context.upcoming_deadline_count(), 1);
+    }
+
+    #[test]
+    fn search_materials_prefers_course_and_term_matches() {
+        let context = LocalContext {
+            deadlines: Vec::new(),
+            timetable: None,
+            materials: vec![
+                MaterialEntry {
+                    id: "worksheet".to_string(),
+                    title: "Matrix Multiplication Worksheet".to_string(),
+                    course: "Matrix Algebra & Linear Models".to_string(),
+                    topic_tags: vec!["matrix_multiplication".to_string()],
+                    material_type: "worksheet".to_string(),
+                    path: "materials/linear/matrix.pdf".to_string(),
+                    snippet: "Compute products and explain undefined cases.".to_string(),
+                },
+                MaterialEntry {
+                    id: "variance-notes".to_string(),
+                    title: "Variance Notes".to_string(),
+                    course: "Probability & Statistics for Scientists".to_string(),
+                    topic_tags: vec!["variance".to_string(), "expectation".to_string()],
+                    material_type: "notes".to_string(),
+                    path: "materials/probability/variance.md".to_string(),
+                    snippet: "Variance as expected squared deviation.".to_string(),
+                },
+            ],
+            courses: CourseCatalog::default(),
+        };
+
+        let matches = context.search_materials(
+            Some("Probability & Statistics for Scientists"),
+            &[String::from("variance")],
+            3,
+        );
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, "variance-notes");
     }
 }

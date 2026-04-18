@@ -15,7 +15,7 @@ pub use content::{
 pub use course::{ConceptDefinition, CourseCatalog, CourseDefinition, TopicDefinition};
 pub use local_data::{
     DeadlineEntry, LocalContext, MaterialEntry, TimetableData, TimetableSlot, load_deadlines,
-    save_deadlines, upsert_deadline,
+    load_materials, save_deadlines, upsert_deadline,
 };
 pub use session::{
     ActivityItem, ActivityStatus, AppSnapshot, BootstrapStudyContext, DeadlineUrgency,

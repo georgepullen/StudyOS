@@ -754,6 +754,32 @@ impl App {
             .map(|item| format!("{}: {}", item.concept_name, item.description))
             .collect::<Vec<_>>()
             .join("; ");
+        let material_terms = self
+            .database
+            .list_due_reviews(3)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|review| review.concept_name)
+            .chain(
+                self.database
+                    .list_recent_misconceptions(3)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|item| item.concept_name),
+            )
+            .collect::<Vec<_>>();
+        let relevant_materials = self
+            .local_context
+            .search_materials(Some(&self.snapshot.course), &material_terms, 3)
+            .into_iter()
+            .map(|entry| {
+                format!(
+                    "{} [{}]: {}",
+                    entry.title, entry.material_type, entry.snippet
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
 
         format!(
             "You are the StudyOS tutor runtime. Return JSON matching the provided schema only.\n\
@@ -767,6 +793,7 @@ impl App {
             Local courses loaded: {course_names}\n\
             Due review concepts: {due_review_concepts}\n\
             Recent misconceptions: {misconceptions}\n\
+            Relevant local materials: {relevant_materials}\n\
             Strictness: {:?}\n\
             Requirements:\n\
             - retrieval first, not explanation first\n\
@@ -794,6 +821,11 @@ impl App {
                 "none".to_string()
             } else {
                 misconceptions
+            },
+            relevant_materials = if relevant_materials.is_empty() {
+                "none".to_string()
+            } else {
+                relevant_materials
             },
         )
     }
@@ -1917,9 +1949,10 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent};
     use studyos_core::{
         AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, ContentBlock,
-        LocalContext, MatrixDimensions, ResponseWidget, ResponseWidgetKind, SessionPlanSummary,
-        TutorBlock, TutorCorrectness, TutorErrorType, TutorEvaluation, TutorMisconception,
-        TutorQuestion, TutorReasoningQuality, TutorTurnPayload, WorkingAnswerField,
+        LocalContext, MaterialEntry, MatrixDimensions, ResponseWidget, ResponseWidgetKind,
+        SessionPlanSummary, TutorBlock, TutorCorrectness, TutorErrorType, TutorEvaluation,
+        TutorMisconception, TutorQuestion, TutorReasoningQuality, TutorTurnPayload,
+        WorkingAnswerField,
     };
 
     use super::{App, AppBootstrap, PendingTurn};
@@ -2211,6 +2244,51 @@ mod tests {
             }
             other => panic!("expected working-answer widget, got {other:?}"),
         }
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn opening_prompt_includes_relevant_local_materials() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+
+        let app = App::new(AppBootstrap {
+            database,
+            paths: paths.clone(),
+            config,
+            stats,
+            local_context: LocalContext {
+                materials: vec![MaterialEntry {
+                    id: "matrix-sheet".to_string(),
+                    title: "Matrix Multiplication Worksheet".to_string(),
+                    course: "Matrix Algebra & Linear Models".to_string(),
+                    topic_tags: vec!["matrix_multiplication".to_string()],
+                    material_type: "worksheet".to_string(),
+                    path: "materials/linear/matrix.pdf".to_string(),
+                    snippet: "Compute products and explain undefined cases.".to_string(),
+                }],
+                ..LocalContext::default()
+            },
+            snapshot,
+            runtime: None,
+            runtime_error: None,
+            resume_state: None,
+        });
+
+        let prompt = app.build_opening_prompt();
+        assert!(prompt.contains("Relevant local materials"));
+        assert!(prompt.contains("Matrix Multiplication Worksheet"));
 
         let _ = fs::remove_dir_all(base);
     }

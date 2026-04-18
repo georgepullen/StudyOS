@@ -152,6 +152,13 @@ cargo run -p studyos-cli -- courses list
 cargo run -p studyos-cli -- courses use --title "Probability & Statistics for Scientists"
 ```
 
+Search local materials metadata:
+
+```bash
+cargo run -p studyos-cli -- materials list
+cargo run -p studyos-cli -- materials search --query "variance"
+```
+
 Example local data files live in:
 
 - [examples/studyos-config.toml](/Users/georgepullen/Documents/StudyOS/examples/studyos-config.toml)

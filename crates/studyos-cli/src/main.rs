@@ -25,6 +25,7 @@ fn main() -> Result<()> {
         Some("doctor") => run_doctor(&paths),
         Some("deadlines") => run_deadlines(&paths, &args[2..]),
         Some("courses") => run_courses(&paths, &args[2..]),
+        Some("materials") => run_materials(&paths, &args[2..]),
         _ => run_interactive(&paths),
     }
 }
@@ -267,6 +268,58 @@ fn run_courses_use(paths: &AppPaths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_materials(paths: &AppPaths, args: &[String]) -> Result<()> {
+    paths.ensure()?;
+
+    match args.first().map(String::as_str) {
+        Some("list") | None => run_materials_list(paths, &args[1.min(args.len())..]),
+        Some("search") => run_materials_search(paths, &args[1..]),
+        Some(other) => Err(anyhow!(
+            "unknown materials subcommand: {other}. Use `materials list` or `materials search`."
+        )),
+    }
+}
+
+fn run_materials_list(paths: &AppPaths, args: &[String]) -> Result<()> {
+    let local_context = LocalContext::load(paths)?;
+    let course_filter = option_value(args, "--course");
+    let materials = local_context.search_materials(
+        course_filter.as_deref(),
+        &[],
+        local_context.materials.len().max(1),
+    );
+
+    if materials.is_empty() {
+        println!(
+            "No local materials matched in {}.",
+            paths.materials_dir.join("manifest.json").display()
+        );
+        return Ok(());
+    }
+
+    print_materials(materials);
+    Ok(())
+}
+
+fn run_materials_search(paths: &AppPaths, args: &[String]) -> Result<()> {
+    let query = required_option(args, "--query")?;
+    let course_filter = option_value(args, "--course");
+    let local_context = LocalContext::load(paths)?;
+    let terms = query
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let materials = local_context.search_materials(course_filter.as_deref(), &terms, 8);
+
+    if materials.is_empty() {
+        println!("No materials matched query `{query}`.");
+        return Ok(());
+    }
+
+    print_materials(materials);
+    Ok(())
+}
+
 fn run_deadlines_list(paths: &AppPaths, args: &[String]) -> Result<()> {
     let course_filter = option_value(args, "--course");
     let mut deadlines = load_deadlines(&paths.deadlines_path)?;
@@ -347,6 +400,18 @@ fn write_if_missing(path: &std::path::Path, contents: &str) -> Result<()> {
 
 fn exists_flag(path: &std::path::Path) -> &'static str {
     if path.exists() { "present" } else { "missing" }
+}
+
+fn print_materials(materials: Vec<studyos_core::MaterialEntry>) {
+    println!("StudyOS materials");
+    for entry in materials {
+        println!(
+            "- {} | {} | {} | {}",
+            entry.title, entry.course, entry.material_type, entry.path
+        );
+        println!("  tags: {}", entry.topic_tags.join(", "));
+        println!("  snippet: {}", entry.snippet);
+    }
 }
 
 fn option_value(args: &[String], flag: &str) -> Option<String> {
