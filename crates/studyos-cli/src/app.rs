@@ -9,10 +9,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Value, json};
 use studyos_core::{
     ActivityItem, ActivityStatus, AppConfig, AppDatabase, AppPaths, AppSnapshot, AppStats,
-    AttemptRecord, ContentBlock, LocalContext, MatrixGridState, MisconceptionInput, PanelTab,
-    ResponseWidget, ResponseWidgetKind, ResumeStateRecord, RetrievalResponseState, SessionMode,
-    SessionRecord, StepListState, TutorCorrectness, TutorErrorType, TutorEvaluation,
-    TutorReasoningQuality, TutorTurnPayload, WarningBox, WorkingAnswerState,
+    AttemptRecord, ContentBlock, LocalContext, MatrixGridState,
+    MisconceptionInput, PanelTab, ResponseWidget, ResponseWidgetKind, ResumeStateRecord,
+    RetrievalResponseState, SessionMode, SessionRecord, StepListState, TutorCorrectness,
+    TutorErrorType, TutorEvaluation, TutorReasoningQuality, TutorTurnPayload, WarningBox,
+    WorkingAnswerState,
 };
 
 use crate::runtime::{AppServerClient, RuntimeEvent};
@@ -557,7 +558,9 @@ impl App {
         self.snapshot.metrics.upcoming_deadlines = stats.upcoming_deadlines;
         self.snapshot.metrics.attempts_logged = stats.total_attempts;
         self.snapshot.metrics.sessions_logged = stats.total_sessions;
-        self.snapshot.deadline_urgency = if stats.upcoming_deadlines > 0 {
+        self.snapshot.deadline_urgency = if stats.upcoming_deadlines >= 2 {
+            studyos_core::DeadlineUrgency::Urgent
+        } else if stats.upcoming_deadlines > 0 {
             studyos_core::DeadlineUrgency::Upcoming
         } else {
             studyos_core::DeadlineUrgency::Calm
@@ -642,6 +645,8 @@ impl App {
             Build a concise opening study step for a real student session.\n\
             Course focus: {course}\n\
             Available session minutes: {minutes}\n\
+            Locally routed opening mode: {mode}\n\
+            Local route rationale: {why_now}\n\
             Due review count: {due_reviews}\n\
             Upcoming deadlines: {deadlines}\n\
             Local courses loaded: {course_names}\n\
@@ -659,6 +664,8 @@ impl App {
             self.config.strictness,
             course = self.snapshot.course,
             minutes = self.snapshot.time_remaining_minutes,
+            mode = self.snapshot.mode.label(),
+            why_now = self.snapshot.plan.why_now,
             due_reviews = self.snapshot.metrics.due_reviews,
             deadlines = deadlines,
             course_names = course_names,
@@ -1662,9 +1669,9 @@ mod tests {
     use std::{env, fs};
 
     use studyos_core::{
-        AppConfig, AppDatabase, AppPaths, AppSnapshot, LocalContext, ResponseWidget,
-        ResponseWidgetKind, SessionPlanSummary, TutorBlock, TutorCorrectness, TutorErrorType,
-        TutorEvaluation, TutorMisconception, TutorQuestion, TutorReasoningQuality,
+        AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, LocalContext,
+        ResponseWidget, ResponseWidgetKind, SessionPlanSummary, TutorBlock, TutorCorrectness,
+        TutorErrorType, TutorEvaluation, TutorMisconception, TutorQuestion, TutorReasoningQuality,
         TutorTurnPayload,
     };
 
@@ -1697,7 +1704,7 @@ mod tests {
         let stats = database
             .stats()
             .unwrap_or_else(|err| panic!("stats query failed: {err}"));
-        let snapshot = AppSnapshot::bootstrap(&config, &stats);
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
 
         let mut app = App::new(AppBootstrap {
             database,

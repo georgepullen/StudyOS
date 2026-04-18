@@ -8,7 +8,10 @@ use std::fs;
 use crate::runtime::AppServerClient;
 use anyhow::Result;
 use app::{App, AppBootstrap};
-use studyos_core::{AppConfig, AppDatabase, AppPaths, AppSnapshot, LocalContext};
+use studyos_core::{
+    AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, LocalContext,
+    StartupMisconceptionItem, StartupReviewItem,
+};
 
 fn main() -> Result<()> {
     let cwd = env::current_dir()?;
@@ -31,7 +34,25 @@ fn run_interactive(paths: &AppPaths) -> Result<()> {
     let mut stats = database.stats()?;
     stats.upcoming_deadlines = local_context.upcoming_deadline_count();
     let resume_state = database.load_resume_state()?;
-    let snapshot = AppSnapshot::bootstrap(&config, &stats);
+    let startup_context = BootstrapStudyContext {
+        due_reviews: database
+            .list_due_reviews(4)?
+            .into_iter()
+            .map(|item| StartupReviewItem {
+                concept_name: item.concept_name,
+            })
+            .collect(),
+        recent_misconceptions: database
+            .list_recent_misconceptions(4)?
+            .into_iter()
+            .map(|item| StartupMisconceptionItem {
+                concept_name: item.concept_name,
+                error_type: item.error_type,
+                description: item.description,
+            })
+            .collect(),
+    };
+    let snapshot = AppSnapshot::bootstrap(&config, &stats, &startup_context);
     let (runtime, runtime_error) = match AppServerClient::spawn() {
         Ok(runtime) => (Some(runtime), None),
         Err(error) => (None, Some(error.to_string())),
@@ -95,8 +116,28 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
     let config = AppConfig::load_or_default(&paths.config_path)?;
     let database = AppDatabase::open(&paths.database_path)?;
     let local_context = LocalContext::load(paths)?;
-    let stats = database.stats()?;
+    let mut stats = database.stats()?;
+    stats.upcoming_deadlines = local_context.upcoming_deadline_count();
     let resume = database.load_resume_state()?;
+    let startup_context = BootstrapStudyContext {
+        due_reviews: database
+            .list_due_reviews(4)?
+            .into_iter()
+            .map(|item| StartupReviewItem {
+                concept_name: item.concept_name,
+            })
+            .collect(),
+        recent_misconceptions: database
+            .list_recent_misconceptions(4)?
+            .into_iter()
+            .map(|item| StartupMisconceptionItem {
+                concept_name: item.concept_name,
+                error_type: item.error_type,
+                description: item.description,
+            })
+            .collect(),
+    };
+    let snapshot = AppSnapshot::bootstrap(&config, &stats, &startup_context);
     let app_server = match AppServerClient::spawn() {
         Ok(runtime) => {
             let initialized = runtime.initialize().is_ok();
@@ -129,6 +170,8 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
     );
     println!("default_course: {}", config.default_course);
     println!("strictness: {:?}", config.strictness);
+    println!("suggested_mode: {}", snapshot.mode.label());
+    println!("mode_why_now: {}", snapshot.plan.why_now);
     println!("sessions_logged: {}", stats.total_sessions);
     println!("attempts_logged: {}", stats.total_attempts);
     println!("due_reviews: {}", stats.due_reviews);

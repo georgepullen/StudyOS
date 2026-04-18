@@ -97,6 +97,24 @@ pub struct SessionPlanSummary {
     pub stretch_target: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StartupReviewItem {
+    pub concept_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StartupMisconceptionItem {
+    pub concept_name: String,
+    pub error_type: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BootstrapStudyContext {
+    pub due_reviews: Vec<StartupReviewItem>,
+    pub recent_misconceptions: Vec<StartupMisconceptionItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivityStatus {
     Idle,
@@ -142,18 +160,31 @@ pub struct AppSnapshot {
 }
 
 impl AppSnapshot {
-    pub fn bootstrap(config: &AppConfig, stats: &AppStats) -> Self {
-        let urgency = if stats.upcoming_deadlines > 0 {
+    pub fn bootstrap(
+        config: &AppConfig,
+        stats: &AppStats,
+        study_context: &BootstrapStudyContext,
+    ) -> Self {
+        let urgency = if stats.upcoming_deadlines >= 2 {
+            DeadlineUrgency::Urgent
+        } else if stats.upcoming_deadlines > 0 {
             DeadlineUrgency::Upcoming
         } else {
             DeadlineUrgency::Calm
         };
+        let mode = choose_start_mode(stats, study_context, urgency);
+        let plan = build_start_plan(config, stats, study_context, mode, urgency);
+        let panel_tab = match mode {
+            SessionMode::Review => PanelTab::DueReviews,
+            SessionMode::Drill => PanelTab::Deadlines,
+            _ => PanelTab::SessionPlan,
+        };
 
         Self {
-            mode: SessionMode::Study,
+            mode,
             course: config.default_course.clone(),
             time_remaining_minutes: config.default_session_minutes,
-            panel_tab: PanelTab::SessionPlan,
+            panel_tab,
             deadline_urgency: urgency,
             metrics: SessionMetrics {
                 due_reviews: stats.due_reviews,
@@ -161,23 +192,7 @@ impl AppSnapshot {
                 attempts_logged: stats.total_attempts,
                 sessions_logged: stats.total_sessions,
             },
-            plan: SessionPlanSummary {
-                recommended_duration_minutes: config.default_session_minutes,
-                why_now: if stats.due_reviews > 0 {
-                    "You have due retrieval items queued, so the session should start by repairing memory before new material.".to_string()
-                } else {
-                    "No due queue yet, so this session should establish a baseline with retrieval-first warmups and one structured matrix task.".to_string()
-                },
-                warm_up_questions: vec![
-                    "State the condition for matrix multiplication dimensions.".to_string(),
-                    "Explain what a singular matrix tells you about invertibility.".to_string(),
-                ],
-                core_targets: vec![
-                    "Matrix multiplication fluency".to_string(),
-                    "Reasoning about invertibility".to_string(),
-                ],
-                stretch_target: Some("Connect determinant zero to linear dependence.".to_string()),
-            },
+            plan,
             transcript: bootstrap_transcript(),
             widget: ResponseWidget::MatrixGrid(MatrixGridState::new(2, 2)),
             scratchpad: "Use this scratchpad for rough working that should not be submitted.\n- jot down row operations\n- note shortcuts\n- park reminders".to_string(),
@@ -284,4 +299,151 @@ fn bootstrap_transcript() -> Vec<ContentBlock> {
             text: "Later iterations will swap these bootstrap cards for app-server generated session plans, question cards, grading feedback, and recaps.".to_string(),
         }),
     ]
+}
+
+fn choose_start_mode(
+    stats: &AppStats,
+    study_context: &BootstrapStudyContext,
+    urgency: DeadlineUrgency,
+) -> SessionMode {
+    let repeated_repairs = study_context
+        .recent_misconceptions
+        .iter()
+        .any(|item| item.error_type == "conceptual_misunderstanding");
+
+    if stats.due_reviews >= 2 || repeated_repairs {
+        SessionMode::Review
+    } else if matches!(urgency, DeadlineUrgency::Urgent) && stats.total_attempts > 0 {
+        SessionMode::Drill
+    } else {
+        SessionMode::Study
+    }
+}
+
+fn build_start_plan(
+    config: &AppConfig,
+    stats: &AppStats,
+    study_context: &BootstrapStudyContext,
+    mode: SessionMode,
+    urgency: DeadlineUrgency,
+) -> SessionPlanSummary {
+    match mode {
+        SessionMode::Review => SessionPlanSummary {
+            recommended_duration_minutes: config.default_session_minutes.min(35),
+            why_now: if !study_context.recent_misconceptions.is_empty() {
+                format!(
+                    "You have active repair work to revisit, starting with {}.",
+                    study_context.recent_misconceptions[0].concept_name
+                )
+            } else {
+                "You have due retrieval items queued, so the session should repair memory before novelty."
+                    .to_string()
+            },
+            warm_up_questions: study_context
+                .due_reviews
+                .iter()
+                .take(2)
+                .map(|item| format!("Retrieve the key rule for {}.", item.concept_name))
+                .chain(
+                    study_context
+                        .recent_misconceptions
+                        .iter()
+                        .take(1)
+                        .map(|item| format!("Explain the mistake behind: {}", item.description)),
+                )
+                .collect(),
+            core_targets: study_context
+                .due_reviews
+                .iter()
+                .take(3)
+                .map(|item| item.concept_name.clone())
+                .collect(),
+            stretch_target: Some(
+                "Only move on if the repair question is genuinely secure.".to_string(),
+            ),
+        },
+        SessionMode::Drill => SessionPlanSummary {
+            recommended_duration_minutes: config.default_session_minutes.min(30),
+            why_now:
+                "A deadline is close enough that this opener should feel exam-like and time-aware."
+                    .to_string(),
+            warm_up_questions: vec![
+                "Predict the output dimensions before you compute anything.".to_string(),
+                "State the most common exam-time failure mode for this topic.".to_string(),
+            ],
+            core_targets: vec![
+                "Fast dimension checks under pressure".to_string(),
+                "Accurate matrix or stats computation without wandering".to_string(),
+            ],
+            stretch_target: Some(match urgency {
+                DeadlineUrgency::Urgent => {
+                    "Finish with one short transfer or interpretation prompt under time pressure."
+                        .to_string()
+                }
+                _ => "Finish with one short transfer prompt.".to_string(),
+            }),
+        },
+        _ => SessionPlanSummary {
+            recommended_duration_minutes: config.default_session_minutes,
+            why_now: if stats.due_reviews > 0 {
+                "You have some memory pressure, but not enough to force a full review block, so start with retrieval and then progress."
+                    .to_string()
+            } else {
+                "No urgent repair queue yet, so this session should establish or extend fluent understanding with retrieval-first warmups."
+                    .to_string()
+            },
+            warm_up_questions: vec![
+                "State the condition for matrix multiplication dimensions.".to_string(),
+                "Explain what a singular matrix tells you about invertibility.".to_string(),
+            ],
+            core_targets: vec![
+                "Matrix multiplication fluency".to_string(),
+                "Reasoning about invertibility".to_string(),
+            ],
+            stretch_target: Some("Connect determinant zero to linear dependence.".to_string()),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AppConfig;
+
+    fn stats(due_reviews: usize, upcoming_deadlines: usize, total_attempts: usize) -> AppStats {
+        AppStats {
+            due_reviews,
+            upcoming_deadlines,
+            total_attempts,
+            total_sessions: 0,
+        }
+    }
+
+    #[test]
+    fn bootstrap_routes_to_review_when_due_reviews_exist() {
+        let config = AppConfig::default();
+        let snapshot = AppSnapshot::bootstrap(
+            &config,
+            &stats(3, 0, 2),
+            &BootstrapStudyContext {
+                due_reviews: vec![StartupReviewItem {
+                    concept_name: "Matrix multiplication dimensions".to_string(),
+                }],
+                recent_misconceptions: Vec::new(),
+            },
+        );
+
+        assert_eq!(snapshot.mode, SessionMode::Review);
+        assert_eq!(snapshot.panel_tab, PanelTab::DueReviews);
+    }
+
+    #[test]
+    fn bootstrap_routes_to_drill_when_deadline_is_urgent() {
+        let config = AppConfig::default();
+        let snapshot =
+            AppSnapshot::bootstrap(&config, &stats(0, 2, 4), &BootstrapStudyContext::default());
+
+        assert_eq!(snapshot.mode, SessionMode::Drill);
+        assert_eq!(snapshot.panel_tab, PanelTab::Deadlines);
+    }
 }

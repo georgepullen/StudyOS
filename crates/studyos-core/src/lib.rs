@@ -15,8 +15,9 @@ pub use content::{
 pub use course::{ConceptDefinition, CourseCatalog, CourseDefinition, TopicDefinition};
 pub use local_data::{DeadlineEntry, LocalContext, MaterialEntry, TimetableData, TimetableSlot};
 pub use session::{
-    ActivityItem, ActivityStatus, AppSnapshot, DeadlineUrgency, KeybindingHint, PanelTab,
-    SessionMetrics, SessionMode, SessionPlanSummary,
+    ActivityItem, ActivityStatus, AppSnapshot, BootstrapStudyContext, DeadlineUrgency,
+    KeybindingHint, PanelTab, SessionMetrics, SessionMode, SessionPlanSummary,
+    StartupMisconceptionItem, StartupReviewItem,
 };
 pub use store::{
     AppDatabase, AppStats, AttemptRecord, DueReviewSummary, MisconceptionInput,
