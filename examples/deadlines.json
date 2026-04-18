@@ -1,0 +1,20 @@
+[
+  {
+    "id": "coursework-linear-models-1",
+    "source": "manual",
+    "title": "Linear Models Problem Sheet",
+    "due_at": "2026-05-08T12:00:00Z",
+    "course": "Matrix Algebra & Linear Models",
+    "weight": 0.25,
+    "notes": "Synthetic example data for local deadline testing."
+  },
+  {
+    "id": "exam-probability-mock",
+    "source": "manual",
+    "title": "Probability Mock Exam",
+    "due_at": "2026-05-15T09:00:00Z",
+    "course": "Probability & Statistics for Scientists",
+    "weight": 0.5,
+    "notes": "Synthetic example data for local deadline testing."
+  }
+]

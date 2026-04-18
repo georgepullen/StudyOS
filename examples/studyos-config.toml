@@ -1,0 +1,11 @@
+default_course = "Matrix Algebra & Linear Models"
+default_session_minutes = 45
+strictness = "standard"
+theme = "system"
+renderer_mode = "auto"
+reduced_motion = false
+
+[focus]
+show_timer = true
+confirm_before_quit = true
+restore_unsent_drafts = true

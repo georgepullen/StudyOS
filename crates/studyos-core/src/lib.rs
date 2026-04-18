@@ -1,3 +1,28 @@
+pub mod config;
+pub mod content;
+pub mod course;
+pub mod local_data;
+pub mod session;
+pub mod store;
+pub mod widgets;
+
+pub use config::{AppConfig, AppPaths, FocusSettings, RendererMode, StrictnessMode, ThemeMode};
+pub use content::{
+    ContentBlock, HeadingBlock, HintCard, MathBlock, MatrixBlock, ParagraphBlock, QuestionCard,
+    RecapBox, WarningBox,
+};
+pub use course::{ConceptDefinition, CourseCatalog, CourseDefinition, TopicDefinition};
+pub use local_data::{DeadlineEntry, LocalContext, MaterialEntry, TimetableData, TimetableSlot};
+pub use session::{
+    ActivityItem, ActivityStatus, AppSnapshot, DeadlineUrgency, KeybindingHint, PanelTab,
+    SessionMetrics, SessionMode, SessionPlanSummary,
+};
+pub use store::{AppDatabase, AppStats, ResumeStateRecord};
+pub use widgets::{
+    MatrixDimensions, MatrixGridState, ResponseWidget, ResponseWidgetKind, RetrievalResponseState,
+    StepListState, WorkingAnswerState,
+};
+
 pub fn bootstrap_message() -> &'static str {
     "StudyOS bootstrap: terminal-native adaptive tutor runtime"
 }

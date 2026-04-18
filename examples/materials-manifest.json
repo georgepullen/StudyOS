@@ -1,0 +1,20 @@
+[
+  {
+    "id": "worksheet-matrix-multiplication",
+    "title": "Matrix Multiplication Worksheet",
+    "course": "Matrix Algebra & Linear Models",
+    "topic_tags": ["matrix_multiplication", "retrieval"],
+    "material_type": "worksheet",
+    "path": "materials/linear-models/matrix-multiplication.pdf",
+    "snippet": "Compute matrix products and explain when multiplication is undefined."
+  },
+  {
+    "id": "notes-variance",
+    "title": "Variance and Expectation Notes",
+    "course": "Probability & Statistics for Scientists",
+    "topic_tags": ["variance", "expectation"],
+    "material_type": "notes",
+    "path": "materials/probability/variance-notes.md",
+    "snippet": "Variance as expected squared deviation from the mean."
+  }
+]

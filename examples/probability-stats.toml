@@ -1,0 +1,28 @@
+course_id = "probability-stats"
+title = "Probability & Statistics for Scientists"
+
+[[topics]]
+id = "expectation-variance"
+title = "Expectation and Variance"
+summary = "Core definitions and interpretation of moments."
+
+[[topics]]
+id = "regression"
+title = "Simple Linear Regression"
+summary = "Interpret slope, noise, and fit in basic linear models."
+
+[[concepts]]
+id = "variance-expected-square-deviation"
+topic_id = "expectation-variance"
+title = "Variance as expected squared deviation"
+summary = "Variance measures the expected squared distance from the mean."
+prerequisite_ids = []
+tags = ["variance", "expectation"]
+
+[[concepts]]
+id = "regression-slope-interpretation"
+topic_id = "regression"
+title = "Regression slope interpretation"
+summary = "The slope represents expected response change per unit increase in the predictor."
+prerequisite_ids = ["variance-expected-square-deviation"]
+tags = ["regression", "slope", "interpretation"]

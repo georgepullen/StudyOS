@@ -1,0 +1,17 @@
+{
+  "timezone": "Europe/London",
+  "slots": [
+    {
+      "day": "monday",
+      "start": "09:00",
+      "end": "10:00",
+      "title": "Linear Algebra Lecture"
+    },
+    {
+      "day": "wednesday",
+      "start": "14:00",
+      "end": "15:00",
+      "title": "Probability Workshop"
+    }
+  ]
+}

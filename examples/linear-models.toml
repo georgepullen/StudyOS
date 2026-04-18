@@ -1,0 +1,28 @@
+course_id = "linear-models"
+title = "Matrix Algebra & Linear Models"
+
+[[topics]]
+id = "matrix-multiplication"
+title = "Matrix Multiplication"
+summary = "Dimension checks, dot products, and fluency with matrix products."
+
+[[topics]]
+id = "determinants"
+title = "Determinants and Invertibility"
+summary = "Use determinants to reason about singularity and solvability."
+
+[[concepts]]
+id = "matrix-multiplication-dimensions"
+topic_id = "matrix-multiplication"
+title = "Matrix multiplication dimensions"
+summary = "Multiplication is defined only when the left matrix column count matches the right matrix row count."
+prerequisite_ids = []
+tags = ["matrix_multiplication", "dimensions"]
+
+[[concepts]]
+id = "determinant-zero-singular"
+topic_id = "determinants"
+title = "Determinant zero implies singular matrix"
+summary = "A zero determinant means the matrix is non-invertible and its rows or columns are linearly dependent."
+prerequisite_ids = ["matrix-multiplication-dimensions"]
+tags = ["determinant", "invertibility", "linear_dependence"]

@@ -108,6 +108,43 @@ Run:
 cargo run -p studyos-cli
 ```
 
+Press `q` to exit the TUI safely.
+
+Initialize local starter files:
+
+```bash
+cargo run -p studyos-cli -- init
+```
+
+Inspect local setup health:
+
+```bash
+cargo run -p studyos-cli -- doctor
+```
+
+Example local data files live in:
+
+- [examples/studyos-config.toml](/Users/georgepullen/Documents/StudyOS/examples/studyos-config.toml)
+- [examples/deadlines.json](/Users/georgepullen/Documents/StudyOS/examples/deadlines.json)
+- [examples/timetable.json](/Users/georgepullen/Documents/StudyOS/examples/timetable.json)
+- [examples/materials-manifest.json](/Users/georgepullen/Documents/StudyOS/examples/materials-manifest.json)
+- [examples/linear-models.toml](/Users/georgepullen/Documents/StudyOS/examples/linear-models.toml)
+- [examples/probability-stats.toml](/Users/georgepullen/Documents/StudyOS/examples/probability-stats.toml)
+
+These should be copied into the local `.studyos/` data directory when you want the shell to load real local context:
+
+```text
+.studyos/
+  config.toml
+  deadlines.json
+  timetable.json
+  courses/
+    linear-models.toml
+    probability-stats.toml
+  materials/
+    manifest.json
+```
+
 ## Repository Setup
 
 Remote:
