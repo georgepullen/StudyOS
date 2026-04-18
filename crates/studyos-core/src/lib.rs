@@ -29,7 +29,7 @@ pub use tutor::{
 };
 pub use widgets::{
     MatrixDimensions, MatrixGridState, ResponseWidget, ResponseWidgetKind, RetrievalResponseState,
-    StepListState, WorkingAnswerState,
+    StepListState, WorkingAnswerField, WorkingAnswerState,
 };
 
 pub fn bootstrap_message() -> &'static str {

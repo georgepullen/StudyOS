@@ -15,7 +15,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
-use studyos_core::{ContentBlock, PanelTab, ResponseWidget, SessionPlanSummary};
+use studyos_core::{
+    ContentBlock, PanelTab, ResponseWidget, SessionPlanSummary, WorkingAnswerField,
+};
 
 use crate::app::{App, FocusRegion, widget_validation_warning};
 
@@ -386,6 +388,10 @@ fn widget_lines(widget: &ResponseWidget) -> Vec<Line<'static>> {
             let mut lines = vec![
                 Line::from("Matrix grid"),
                 Line::from("Arrow keys move, type to fill cells, backspace to edit."),
+                Line::from(format!(
+                    "Expected shape: {} x {}",
+                    state.dimensions.rows, state.dimensions.cols
+                )),
                 Line::from(""),
             ];
 
@@ -417,21 +423,43 @@ fn widget_lines(widget: &ResponseWidget) -> Vec<Line<'static>> {
         }
         ResponseWidget::WorkingAnswer(state) => vec![
             Line::from("Working + final answer"),
-            Line::from("Type normally to build working. Shift+character appends to final answer."),
+            Line::from("Up/Down switches between working and final answer."),
             Line::from(""),
             Line::from(Span::styled(
-                "Working",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                if matches!(state.active_field, WorkingAnswerField::Working) {
+                    "> Working"
+                } else {
+                    "  Working"
+                },
+                if matches!(state.active_field, WorkingAnswerField::Working) {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                },
             )),
             Line::from(state.working.clone()),
             Line::from(""),
             Line::from(Span::styled(
-                "Final answer",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                if matches!(state.active_field, WorkingAnswerField::FinalAnswer) {
+                    "> Final answer"
+                } else {
+                    "  Final answer"
+                },
+                if matches!(state.active_field, WorkingAnswerField::FinalAnswer) {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                },
             )),
             Line::from(if state.final_answer.is_empty() {
                 "·".to_string()

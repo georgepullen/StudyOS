@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::widgets::ResponseWidgetKind;
+use crate::widgets::{MatrixDimensions, ResponseWidgetKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentBlock {
@@ -45,6 +45,7 @@ pub struct QuestionCard {
     pub prompt: String,
     pub concept_tags: Vec<String>,
     pub widget_kind: ResponseWidgetKind,
+    pub matrix_dimensions: Option<MatrixDimensions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

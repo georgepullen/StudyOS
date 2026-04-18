@@ -38,6 +38,16 @@ impl MatrixGridState {
 pub struct WorkingAnswerState {
     pub working: String,
     pub final_answer: String,
+    #[serde(default)]
+    pub active_field: WorkingAnswerField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingAnswerField {
+    #[default]
+    Working,
+    FinalAnswer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

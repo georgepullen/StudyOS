@@ -9,11 +9,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Value, json};
 use studyos_core::{
     ActivityItem, ActivityStatus, AppConfig, AppDatabase, AppPaths, AppSnapshot, AppStats,
-    AttemptRecord, ContentBlock, LocalContext, MatrixGridState, MisconceptionInput, PanelTab,
-    ResponseWidget, ResponseWidgetKind, ResumeStateRecord, RetrievalResponseState, SessionMode,
-    SessionRecapRecord, SessionRecapSummary, SessionRecord, StepListState, TutorCorrectness,
-    TutorErrorType, TutorEvaluation, TutorReasoningQuality, TutorSessionClosePayload,
-    TutorTurnPayload, WarningBox, WorkingAnswerState,
+    AttemptRecord, ContentBlock, LocalContext, MatrixDimensions, MatrixGridState,
+    MisconceptionInput, PanelTab, QuestionCard, ResponseWidget, ResponseWidgetKind,
+    ResumeStateRecord, RetrievalResponseState, SessionMode, SessionRecapRecord,
+    SessionRecapSummary, SessionRecord, StepListState, TutorCorrectness, TutorErrorType,
+    TutorEvaluation, TutorReasoningQuality, TutorSessionClosePayload, TutorTurnPayload, WarningBox,
+    WorkingAnswerField, WorkingAnswerState,
 };
 
 use crate::runtime::{AppServerClient, RuntimeEvent};
@@ -130,7 +131,7 @@ impl App {
                     return None;
                 };
 
-                Some((*index, default_widget_state(card.widget_kind)))
+                Some((*index, widget_state_for_question(card)))
             })
             .collect();
         let question_presented_at = question_indices
@@ -772,8 +773,9 @@ impl App {
             - one short session plan\n\
             - 1 to 3 teaching blocks max before the question\n\
             - exactly one active question using one of the supported widgets\n\
+            - always include matrix_dimensions; set it to null for non-matrix widgets\n\
             - evaluation must be null on this opening turn\n\
-            - prefer matrix_grid for matrix algebra warmups when appropriate\n\
+            - prefer matrix_grid for matrix algebra warmups when appropriate and set matrix_dimensions to the intended answer shape\n\
             - keep the tone direct and anti-passive",
             self.config.strictness,
             course = self.snapshot.course,
@@ -815,6 +817,7 @@ impl App {
             - if the answer is weak, repair the misconception before novelty\n\
             - if the answer is correct, ask one transfer or explanation question next\n\
             - keep the session plan short and updated\n\
+            - always include matrix_dimensions; set it to null for non-matrix widgets\n\
             - include evaluation with correctness, reasoning_quality, feedback_summary, and misconception when warranted\n\
             - provide exactly one next active question",
             self.snapshot.mode.label(),
@@ -1273,7 +1276,7 @@ impl App {
         for index in start_index..self.snapshot.transcript.len() {
             if let Some(ContentBlock::QuestionCard(card)) = self.snapshot.transcript.get(index) {
                 self.widget_states
-                    .insert(index, default_widget_state(card.widget_kind));
+                    .insert(index, widget_state_for_question(card));
                 self.question_presented_at.insert(index, Instant::now());
                 self.active_question_index = index;
             }
@@ -1431,9 +1434,14 @@ impl App {
     }
 }
 
-fn default_widget_state(kind: ResponseWidgetKind) -> ResponseWidget {
-    match kind {
-        ResponseWidgetKind::MatrixGrid => ResponseWidget::MatrixGrid(MatrixGridState::new(2, 2)),
+fn widget_state_for_question(card: &QuestionCard) -> ResponseWidget {
+    match card.widget_kind {
+        ResponseWidgetKind::MatrixGrid => {
+            let dimensions = card
+                .matrix_dimensions
+                .unwrap_or(MatrixDimensions { rows: 2, cols: 2 });
+            ResponseWidget::MatrixGrid(MatrixGridState::new(dimensions.rows, dimensions.cols))
+        }
         ResponseWidgetKind::WorkingAnswer => {
             ResponseWidget::WorkingAnswer(WorkingAnswerState::default())
         }
@@ -1496,19 +1504,26 @@ fn handle_matrix_widget(state: &mut MatrixGridState, key: KeyEvent) {
 
 fn handle_working_widget(state: &mut WorkingAnswerState, key: KeyEvent) {
     match key.code {
-        KeyCode::Backspace => {
-            if !state.final_answer.is_empty() {
-                state.final_answer.pop();
-            } else {
+        KeyCode::Up => state.active_field = WorkingAnswerField::Working,
+        KeyCode::Down => state.active_field = WorkingAnswerField::FinalAnswer,
+        KeyCode::Backspace => match state.active_field {
+            WorkingAnswerField::Working => {
                 state.working.pop();
             }
-        }
-        KeyCode::Enter => state.working.push('\n'),
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            state.final_answer.push(c);
+            WorkingAnswerField::FinalAnswer => {
+                state.final_answer.pop();
+            }
+        },
+        KeyCode::Enter => {
+            if matches!(state.active_field, WorkingAnswerField::Working) {
+                state.working.push('\n');
+            }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.working.push(c);
+            match state.active_field {
+                WorkingAnswerField::Working => state.working.push(c),
+                WorkingAnswerField::FinalAnswer => state.final_answer.push(c),
+            }
         }
         _ => {}
     }
@@ -1707,9 +1722,18 @@ fn tutor_output_schema() -> Value {
                     "widget_kind": {
                         "type": "string",
                         "enum": ["matrix_grid", "working_answer", "step_list", "retrieval_response"]
+                    },
+                    "matrix_dimensions": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "rows": { "type": "integer", "minimum": 1, "maximum": 6 },
+                            "cols": { "type": "integer", "minimum": 1, "maximum": 6 }
+                        },
+                        "required": ["rows", "cols"],
+                        "additionalProperties": false
                     }
                 },
-                "required": ["title", "prompt", "concept_tags", "widget_kind"],
+                "required": ["title", "prompt", "concept_tags", "widget_kind", "matrix_dimensions"],
                 "additionalProperties": false
             },
             "evaluation": {
@@ -1885,22 +1909,29 @@ fn tutor_close_output_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs};
+    use std::{
+        env, fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     use crossterm::event::{KeyCode, KeyEvent};
     use studyos_core::{
-        AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, LocalContext,
-        ResponseWidget, ResponseWidgetKind, SessionPlanSummary, TutorBlock, TutorCorrectness,
-        TutorErrorType, TutorEvaluation, TutorMisconception, TutorQuestion, TutorReasoningQuality,
-        TutorTurnPayload,
+        AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, ContentBlock,
+        LocalContext, MatrixDimensions, ResponseWidget, ResponseWidgetKind, SessionPlanSummary,
+        TutorBlock, TutorCorrectness, TutorErrorType, TutorEvaluation, TutorMisconception,
+        TutorQuestion, TutorReasoningQuality, TutorTurnPayload, WorkingAnswerField,
     };
 
     use super::{App, AppBootstrap, PendingTurn};
 
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn temp_data_root() -> std::path::PathBuf {
+        let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = env::temp_dir().join(format!(
-            "studyos-app-test-{}-{}",
+            "studyos-app-test-{}-{}-{}",
             std::process::id(),
+            counter,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_nanos())
@@ -1967,6 +1998,7 @@ mod tests {
                 prompt: "State the inner-dimension rule.".to_string(),
                 concept_tags: vec!["matrix_multiplication".to_string()],
                 widget_kind: ResponseWidgetKind::RetrievalResponse,
+                matrix_dimensions: None,
             }),
             evaluation: Some(TutorEvaluation {
                 correctness: TutorCorrectness::Incorrect,
@@ -2050,6 +2082,135 @@ mod tests {
         assert!(app.quit_recap_preview().is_none());
         assert_eq!(app.current_mode_label(), "Study");
         assert!(!app.should_quit);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn structured_matrix_question_uses_declared_dimensions() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+
+        let mut app = App::new(AppBootstrap {
+            database,
+            paths: paths.clone(),
+            config,
+            stats,
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: None,
+            runtime_error: None,
+            resume_state: None,
+        });
+
+        let payload = TutorTurnPayload {
+            session_plan: Some(SessionPlanSummary {
+                recommended_duration_minutes: 10,
+                why_now: "Practice a rectangular matrix product.".to_string(),
+                warm_up_questions: vec!["What is the shape of the output?".to_string()],
+                core_targets: vec!["Matrix multiplication".to_string()],
+                stretch_target: None,
+            }),
+            teaching_blocks: vec![TutorBlock::Paragraph {
+                text: "Fill the product directly in the target grid.".to_string(),
+            }],
+            question: Some(TutorQuestion {
+                title: "Rectangular Product".to_string(),
+                prompt: "Enter the 2 by 3 output matrix.".to_string(),
+                concept_tags: vec!["matrix_multiplication".to_string()],
+                widget_kind: ResponseWidgetKind::MatrixGrid,
+                matrix_dimensions: Some(MatrixDimensions { rows: 2, cols: 3 }),
+            }),
+            evaluation: None,
+        };
+
+        let raw = serde_json::to_string(&payload)
+            .unwrap_or_else(|err| panic!("payload serialization failed: {err}"));
+        app.apply_structured_tutor_payload("turn-open", &raw);
+
+        let widget = app
+            .active_widget()
+            .unwrap_or_else(|| panic!("matrix widget should be active"));
+        match widget {
+            ResponseWidget::MatrixGrid(state) => {
+                assert_eq!(state.dimensions.rows, 2);
+                assert_eq!(state.dimensions.cols, 3);
+                assert_eq!(state.cells.len(), 2);
+                assert_eq!(state.cells[0].len(), 3);
+            }
+            other => panic!("expected matrix widget, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn working_answer_widget_switches_between_fields() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+
+        let mut app = App::new(AppBootstrap {
+            database,
+            paths: paths.clone(),
+            config,
+            stats,
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: None,
+            runtime_error: None,
+            resume_state: None,
+        });
+
+        app.active_question_index = app
+            .snapshot
+            .transcript
+            .iter()
+            .enumerate()
+            .find_map(|(index, block)| match block {
+                ContentBlock::QuestionCard(card)
+                    if matches!(card.widget_kind, ResponseWidgetKind::WorkingAnswer) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("working-answer question should exist in bootstrap"));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        app.handle_key(KeyEvent::from(KeyCode::Char('7')));
+
+        let widget = app
+            .active_widget()
+            .unwrap_or_else(|| panic!("working-answer widget should be active"));
+        match widget {
+            ResponseWidget::WorkingAnswer(state) => {
+                assert_eq!(state.working, "x");
+                assert_eq!(state.final_answer, "7");
+                assert_eq!(state.active_field, WorkingAnswerField::FinalAnswer);
+            }
+            other => panic!("expected working-answer widget, got {other:?}"),
+        }
 
         let _ = fs::remove_dir_all(base);
     }

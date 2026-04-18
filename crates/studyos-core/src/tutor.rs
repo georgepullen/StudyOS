@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ContentBlock, HintCard, MathBlock, MatrixBlock, ParagraphBlock, QuestionCard, RecapBox,
     ResponseWidgetKind, SessionPlanSummary, SessionRecapSummary, WarningBox,
+    widgets::MatrixDimensions,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +43,7 @@ pub struct TutorQuestion {
     pub prompt: String,
     pub concept_tags: Vec<String>,
     pub widget_kind: ResponseWidgetKind,
+    pub matrix_dimensions: Option<MatrixDimensions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +140,7 @@ impl TutorTurnPayload {
                 prompt: question.prompt,
                 concept_tags: question.concept_tags,
                 widget_kind: question.widget_kind,
+                matrix_dimensions: question.matrix_dimensions,
             }));
         }
 
@@ -167,6 +170,7 @@ mod tests {
                 prompt: "What dimensions must match before multiplying AB?".to_string(),
                 concept_tags: vec!["matrix multiplication".to_string()],
                 widget_kind: ResponseWidgetKind::RetrievalResponse,
+                matrix_dimensions: None,
             }),
             evaluation: None,
         };
@@ -175,6 +179,11 @@ mod tests {
         assert_eq!(blocks.len(), 3);
         assert!(matches!(blocks[0], ContentBlock::Paragraph(_)));
         assert!(matches!(blocks[1], ContentBlock::MathBlock(_)));
-        assert!(matches!(blocks[2], ContentBlock::QuestionCard(_)));
+        match &blocks[2] {
+            ContentBlock::QuestionCard(card) => {
+                assert_eq!(card.matrix_dimensions, None);
+            }
+            other => panic!("expected question card, got {other:?}"),
+        }
     }
 }

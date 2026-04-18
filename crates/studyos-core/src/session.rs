@@ -270,6 +270,7 @@ fn bootstrap_transcript() -> Vec<ContentBlock> {
                 "structured_input".to_string(),
             ],
             widget_kind: ResponseWidgetKind::MatrixGrid,
+            matrix_dimensions: Some(crate::MatrixDimensions { rows: 2, cols: 2 }),
         }),
         ContentBlock::HintCard(HintCard {
             title: "Hint".to_string(),
@@ -298,12 +299,14 @@ fn bootstrap_transcript() -> Vec<ContentBlock> {
             prompt: "In one sentence, explain what it means if det(A) = 0 for a square matrix A.".to_string(),
             concept_tags: vec!["determinant".to_string(), "invertibility".to_string()],
             widget_kind: ResponseWidgetKind::RetrievalResponse,
+            matrix_dimensions: None,
         }),
         ContentBlock::QuestionCard(QuestionCard {
             title: "Method-mark Prompt".to_string(),
             prompt: "Outline your working for solving a 2x2 linear system, then give the final solution vector.".to_string(),
             concept_tags: vec!["linear_systems".to_string()],
             widget_kind: ResponseWidgetKind::WorkingAnswer,
+            matrix_dimensions: None,
         }),
         ContentBlock::Paragraph(ParagraphBlock {
             text: "Later iterations will swap these bootstrap cards for app-server generated session plans, question cards, grading feedback, and recaps.".to_string(),
