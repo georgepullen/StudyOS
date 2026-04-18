@@ -10,8 +10,8 @@ use anyhow::{Result, anyhow};
 use app::{App, AppBootstrap};
 use studyos_core::{
     AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, CourseCatalog,
-    DeadlineEntry, LocalContext, StartupMisconceptionItem, StartupReviewItem, load_deadlines,
-    upsert_deadline,
+    DeadlineEntry, LocalContext, StartupMisconceptionItem, StartupReviewItem, TimetableSlot,
+    append_timetable_slot, load_deadlines, upsert_deadline,
 };
 
 fn main() -> Result<()> {
@@ -26,6 +26,7 @@ fn main() -> Result<()> {
         Some("deadlines") => run_deadlines(&paths, &args[2..]),
         Some("courses") => run_courses(&paths, &args[2..]),
         Some("materials") => run_materials(&paths, &args[2..]),
+        Some("timetable") => run_timetable(&paths, &args[2..]),
         _ => run_interactive(&paths),
     }
 }
@@ -317,6 +318,83 @@ fn run_materials_search(paths: &AppPaths, args: &[String]) -> Result<()> {
     }
 
     print_materials(materials);
+    Ok(())
+}
+
+fn run_timetable(paths: &AppPaths, args: &[String]) -> Result<()> {
+    paths.ensure()?;
+
+    match args.first().map(String::as_str) {
+        Some("show") | None => run_timetable_show(paths),
+        Some("today") => run_timetable_today(paths),
+        Some("add") => run_timetable_add(paths, &args[1..]),
+        Some(other) => Err(anyhow!(
+            "unknown timetable subcommand: {other}. Use `timetable show`, `timetable today`, or `timetable add`."
+        )),
+    }
+}
+
+fn run_timetable_show(paths: &AppPaths) -> Result<()> {
+    let local_context = LocalContext::load(paths)?;
+    let Some(timetable) = local_context.timetable else {
+        println!(
+            "No timetable file loaded at {}",
+            paths.timetable_path.display()
+        );
+        return Ok(());
+    };
+
+    println!("StudyOS timetable ({})", timetable.timezone);
+    for slot in timetable.slots {
+        println!(
+            "- {} {}-{} | {}",
+            slot.day, slot.start, slot.end, slot.title
+        );
+    }
+
+    Ok(())
+}
+
+fn run_timetable_today(paths: &AppPaths) -> Result<()> {
+    let local_context = LocalContext::load(paths)?;
+    let today_slots = local_context.today_timetable_slots();
+
+    if today_slots.is_empty() {
+        println!("No timetable slots scheduled for today.");
+        return Ok(());
+    }
+
+    println!("StudyOS timetable for today");
+    for slot in today_slots {
+        println!("- {}-{} | {}", slot.start, slot.end, slot.title);
+    }
+
+    Ok(())
+}
+
+fn run_timetable_add(paths: &AppPaths, args: &[String]) -> Result<()> {
+    let day = required_option(args, "--day")?;
+    let start = required_option(args, "--start")?;
+    let end = required_option(args, "--end")?;
+    let title = required_option(args, "--title")?;
+    let timezone = option_value(args, "--timezone").unwrap_or_else(|| "Europe/London".to_string());
+
+    let timetable = append_timetable_slot(
+        &paths.timetable_path,
+        timezone,
+        TimetableSlot {
+            day,
+            start,
+            end,
+            title,
+        },
+    )?;
+
+    println!(
+        "Saved timetable slot to {} ({} total slots).",
+        paths.timetable_path.display(),
+        timetable.slots.len()
+    );
     Ok(())
 }
 

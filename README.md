@@ -159,6 +159,14 @@ cargo run -p studyos-cli -- materials list
 cargo run -p studyos-cli -- materials search --query "variance"
 ```
 
+Inspect the local timetable:
+
+```bash
+cargo run -p studyos-cli -- timetable show
+cargo run -p studyos-cli -- timetable today
+cargo run -p studyos-cli -- timetable add --day friday --start 11:00 --end 12:00 --title "Stats Seminar"
+```
+
 Example local data files live in:
 
 - [examples/studyos-config.toml](/Users/georgepullen/Documents/StudyOS/examples/studyos-config.toml)

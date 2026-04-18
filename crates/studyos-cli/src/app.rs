@@ -580,6 +580,12 @@ impl App {
                 timetable.slots.len(),
                 timetable.timezone
             ));
+            for slot in self.local_context.next_timetable_slots(3) {
+                lines.push(format!(
+                    "• {} {}-{} {}",
+                    slot.day, slot.start, slot.end, slot.title
+                ));
+            }
         }
 
         lines
@@ -780,6 +786,13 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("; ");
+        let timetable_summary = self
+            .local_context
+            .next_timetable_slots(3)
+            .into_iter()
+            .map(|slot| format!("{} {}-{} {}", slot.day, slot.start, slot.end, slot.title))
+            .collect::<Vec<_>>()
+            .join("; ");
 
         format!(
             "You are the StudyOS tutor runtime. Return JSON matching the provided schema only.\n\
@@ -794,6 +807,7 @@ impl App {
             Due review concepts: {due_review_concepts}\n\
             Recent misconceptions: {misconceptions}\n\
             Relevant local materials: {relevant_materials}\n\
+            Upcoming timetable slots: {timetable_summary}\n\
             Strictness: {:?}\n\
             Requirements:\n\
             - retrieval first, not explanation first\n\
@@ -826,6 +840,11 @@ impl App {
                 "none".to_string()
             } else {
                 relevant_materials
+            },
+            timetable_summary = if timetable_summary.is_empty() {
+                "none".to_string()
+            } else {
+                timetable_summary
             },
         )
     }
