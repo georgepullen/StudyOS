@@ -709,6 +709,7 @@ dependencies = [
  "anyhow",
  "crossterm 0.29.0",
  "ratatui",
+ "serde_json",
  "studyos-core",
  "toml",
 ]

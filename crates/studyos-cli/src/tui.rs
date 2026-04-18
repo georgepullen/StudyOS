@@ -37,6 +37,7 @@ pub fn run(mut app: App) -> Result<()> {
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
+        app.poll_runtime();
         terminal.draw(|frame| render(frame, app))?;
 
         if app.should_quit {
@@ -45,7 +46,9 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
-                app.handle_key(key);
+                if let Some(action) = app.handle_key(key) {
+                    app.execute_action(action);
+                }
                 app.persist_resume_state()?;
             }
         }
@@ -488,6 +491,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, app: &App) {
         Line::from("?        toggle this help"),
         Line::from("1..6     switch side panel tabs"),
         Line::from("[ / ]    move between question cards"),
+        Line::from("F5       submit active structured answer"),
         Line::from(""),
         Line::from(format!("Current focus: {}", app.focus.label())),
         Line::from("Transcript focus: arrows scroll"),

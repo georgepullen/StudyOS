@@ -14,6 +14,7 @@ pub struct AppStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeStateRecord {
     pub session_id: String,
+    pub runtime_thread_id: Option<String>,
     pub active_mode: String,
     pub active_question_id: Option<String>,
     pub focused_panel: String,
@@ -56,7 +57,7 @@ impl AppDatabase {
             .connection
             .query_row(
                 "
-                SELECT session_id, active_mode, active_question_id, focused_panel, draft_payload, scratchpad_text
+                SELECT session_id, runtime_thread_id, active_mode, active_question_id, focused_panel, draft_payload, scratchpad_text
                 FROM resume_state
                 ORDER BY saved_at DESC
                 LIMIT 1
@@ -65,11 +66,12 @@ impl AppDatabase {
                 |row| {
                     Ok(ResumeStateRecord {
                         session_id: row.get(0)?,
-                        active_mode: row.get(1)?,
-                        active_question_id: row.get(2)?,
-                        focused_panel: row.get(3)?,
-                        draft_payload: row.get(4)?,
-                        scratchpad_text: row.get(5)?,
+                        runtime_thread_id: row.get(1)?,
+                        active_mode: row.get(2)?,
+                        active_question_id: row.get(3)?,
+                        focused_panel: row.get(4)?,
+                        draft_payload: row.get(5)?,
+                        scratchpad_text: row.get(6)?,
                     })
                 },
             )
@@ -82,10 +84,11 @@ impl AppDatabase {
         self.connection.execute(
             "
             INSERT INTO resume_state (
-                session_id, saved_at, active_mode, active_question_id, focused_panel, draft_payload, scratchpad_text
+                session_id, runtime_thread_id, saved_at, active_mode, active_question_id, focused_panel, draft_payload, scratchpad_text
             )
-            VALUES (?1, datetime('now'), ?2, ?3, ?4, ?5, ?6)
+            VALUES (?1, ?2, datetime('now'), ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(session_id) DO UPDATE SET
+                runtime_thread_id = excluded.runtime_thread_id,
                 saved_at = excluded.saved_at,
                 active_mode = excluded.active_mode,
                 active_question_id = excluded.active_question_id,
@@ -95,6 +98,7 @@ impl AppDatabase {
             ",
             params![
                 record.session_id,
+                record.runtime_thread_id,
                 record.active_mode,
                 record.active_question_id,
                 record.focused_panel,
@@ -183,6 +187,7 @@ impl AppDatabase {
 
             CREATE TABLE IF NOT EXISTS resume_state (
                 session_id TEXT PRIMARY KEY,
+                runtime_thread_id TEXT,
                 saved_at TEXT NOT NULL,
                 active_mode TEXT NOT NULL,
                 active_question_id TEXT,
@@ -193,7 +198,29 @@ impl AppDatabase {
             ",
         )?;
 
+        self.migrate_resume_state()?;
         self.seed_default_concepts()?;
+        Ok(())
+    }
+
+    fn migrate_resume_state(&self) -> Result<()> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(resume_state)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        let mut has_runtime_thread_id = false;
+
+        for column in columns {
+            if column? == "runtime_thread_id" {
+                has_runtime_thread_id = true;
+            }
+        }
+
+        if !has_runtime_thread_id {
+            self.connection.execute(
+                "ALTER TABLE resume_state ADD COLUMN runtime_thread_id TEXT",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -240,58 +267,69 @@ mod tests {
 
     use super::{AppDatabase, ResumeStateRecord};
 
-    fn temp_db_path() -> std::path::PathBuf {
+    fn temp_db_dir() -> std::path::PathBuf {
         let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(duration) => duration.as_nanos(),
             Err(_) => 0,
         };
 
-        env::temp_dir().join(format!("studyos-test-{}-{nanos}.db", std::process::id()))
+        let dir = env::temp_dir().join(format!("studyos-test-{}-{nanos}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("failed to create temp dir: {err}"));
+        dir
     }
 
     #[test]
     fn database_bootstrap_seeds_initial_stats() {
-        let path = temp_db_path();
-        let database =
-            AppDatabase::open(&path).unwrap_or_else(|err| panic!("database open failed: {err}"));
-        let stats = database
-            .stats()
-            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        {
+            let database = AppDatabase::open(&path)
+                .unwrap_or_else(|err| panic!("database open failed: {err}"));
+            let stats = database
+                .stats()
+                .unwrap_or_else(|err| panic!("stats query failed: {err}"));
 
-        assert_eq!(stats.due_reviews, 0);
-        assert_eq!(stats.upcoming_deadlines, 0);
+            assert_eq!(stats.due_reviews, 0);
+            assert_eq!(stats.upcoming_deadlines, 0);
+        }
 
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn resume_state_round_trips() {
-        let path = temp_db_path();
-        let database =
-            AppDatabase::open(&path).unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        {
+            let database = AppDatabase::open(&path)
+                .unwrap_or_else(|err| panic!("database open failed: {err}"));
 
-        let record = ResumeStateRecord {
-            session_id: "test-session".to_string(),
-            active_mode: "Study".to_string(),
-            active_question_id: Some("4".to_string()),
-            focused_panel: "Scratchpad".to_string(),
-            draft_payload: "draft = true".to_string(),
-            scratchpad_text: "rough working".to_string(),
-        };
+            let record = ResumeStateRecord {
+                session_id: "test-session".to_string(),
+                runtime_thread_id: Some("runtime-thread".to_string()),
+                active_mode: "Study".to_string(),
+                active_question_id: Some("4".to_string()),
+                focused_panel: "Scratchpad".to_string(),
+                draft_payload: "draft = true".to_string(),
+                scratchpad_text: "rough working".to_string(),
+            };
 
-        database
-            .save_resume_state(&record)
-            .unwrap_or_else(|err| panic!("resume save failed: {err}"));
+            database
+                .save_resume_state(&record)
+                .unwrap_or_else(|err| panic!("resume save failed: {err}"));
 
-        let loaded = database
-            .load_resume_state()
-            .unwrap_or_else(|err| panic!("resume load failed: {err}"))
-            .unwrap_or_else(|| panic!("missing resume state"));
+            let loaded = database
+                .load_resume_state()
+                .unwrap_or_else(|err| panic!("resume load failed: {err}"))
+                .unwrap_or_else(|| panic!("missing resume state"));
 
-        assert_eq!(loaded.session_id, record.session_id);
-        assert_eq!(loaded.focused_panel, record.focused_panel);
-        assert_eq!(loaded.scratchpad_text, record.scratchpad_text);
+            assert_eq!(loaded.session_id, record.session_id);
+            assert_eq!(loaded.runtime_thread_id, record.runtime_thread_id);
+            assert_eq!(loaded.focused_panel, record.focused_panel);
+            assert_eq!(loaded.scratchpad_text, record.scratchpad_text);
+        }
 
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(dir);
     }
 }

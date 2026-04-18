@@ -67,6 +67,7 @@ Launcher / Focus Wrapper
 Included early:
 
 - Rust TUI shell
+- Codex app-server session runtime over `stdio`
 - streamed transcript rendering
 - structured answer widgets
 - local memory database
@@ -83,14 +84,15 @@ Deferred until after the core loop works:
 
 ## Status
 
-This repository is currently in bootstrap stage. The first implementation steps are:
+This repository now has the first end-to-end tutor loop wired up:
 
-1. create the Rust workspace and crate layout
-2. define the internal content and response schemas
-3. build the TUI shell
-4. integrate Codex app-server streaming
-5. implement structured maths input widgets
-6. add SQLite-backed study memory
+1. launch the Rust TUI shell
+2. boot Codex app-server locally
+3. start or resume a tutor thread
+4. request a schema-constrained opening study step
+5. render the returned teaching blocks and structured question
+6. submit a structured answer for grading and the next question
+7. persist local resume state in SQLite
 
 Detailed V1 implementation docs live in:
 
@@ -101,6 +103,7 @@ Detailed V1 implementation docs live in:
 Prerequisites:
 
 - Rust stable
+- local `codex` CLI installed and authenticated
 
 Run:
 
@@ -108,7 +111,14 @@ Run:
 cargo run -p studyos-cli
 ```
 
-Press `q` to exit the TUI safely.
+Useful keys:
+
+- `q` safe exit
+- `tab` cycle focus regions
+- `1` to `6` switch side panels
+- `[` and `]` jump between active questions
+- `F5` submit the active structured answer
+- `?` show help
 
 Initialize local starter files:
 
@@ -158,7 +168,7 @@ Current branch:
 Workspace:
 
 - `crates/studyos-cli`: executable entry point
-- `crates/studyos-core`: shared domain types and runtime logic
+- `crates/studyos-core`: shared domain types, persistence, and tutor payload models
 
 Public repo safety defaults:
 

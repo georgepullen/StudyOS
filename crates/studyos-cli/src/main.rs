@@ -1,11 +1,13 @@
 mod app;
+mod runtime;
 mod tui;
 
 use std::env;
 use std::fs;
 
+use crate::runtime::AppServerClient;
 use anyhow::Result;
-use app::App;
+use app::{App, AppBootstrap};
 use studyos_core::{AppConfig, AppDatabase, AppPaths, AppSnapshot, LocalContext};
 
 fn main() -> Result<()> {
@@ -30,16 +32,25 @@ fn run_interactive(paths: &AppPaths) -> Result<()> {
     stats.upcoming_deadlines = local_context.upcoming_deadline_count();
     let resume_state = database.load_resume_state()?;
     let snapshot = AppSnapshot::bootstrap(&config, &stats);
+    let (runtime, runtime_error) = match AppServerClient::spawn() {
+        Ok(runtime) => (Some(runtime), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
 
-    let app = App::new(
-        paths.clone(),
+    let mut app = App::new(AppBootstrap {
+        database,
+        paths: paths.clone(),
         config,
         stats,
-        snapshot,
-        database,
         local_context,
+        snapshot,
+        runtime,
+        runtime_error,
         resume_state,
-    );
+    });
+    if let Err(error) = app.bootstrap_runtime() {
+        eprintln!("StudyOS runtime bootstrap warning: {error}");
+    }
     tui::run(app)
 }
 
@@ -86,6 +97,13 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
     let local_context = LocalContext::load(paths)?;
     let stats = database.stats()?;
     let resume = database.load_resume_state()?;
+    let app_server = match AppServerClient::spawn() {
+        Ok(runtime) => {
+            let initialized = runtime.initialize().is_ok();
+            format!("available (initialize={initialized})")
+        }
+        Err(error) => format!("unavailable ({error})"),
+    };
 
     println!("StudyOS doctor");
     println!("data_dir: {}", paths.root_dir.display());
@@ -118,6 +136,7 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
     println!("loaded_materials: {}", local_context.materials.len());
     println!("loaded_courses: {}", local_context.courses.courses.len());
     println!("resume_state_present: {}", resume.is_some());
+    println!("app_server: {}", app_server);
 
     Ok(())
 }

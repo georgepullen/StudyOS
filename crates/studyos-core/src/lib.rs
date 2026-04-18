@@ -4,6 +4,7 @@ pub mod course;
 pub mod local_data;
 pub mod session;
 pub mod store;
+pub mod tutor;
 pub mod widgets;
 
 pub use config::{AppConfig, AppPaths, FocusSettings, RendererMode, StrictnessMode, ThemeMode};
@@ -18,6 +19,7 @@ pub use session::{
     SessionMetrics, SessionMode, SessionPlanSummary,
 };
 pub use store::{AppDatabase, AppStats, ResumeStateRecord};
+pub use tutor::{TutorBlock, TutorQuestion, TutorTurnPayload};
 pub use widgets::{
     MatrixDimensions, MatrixGridState, ResponseWidget, ResponseWidgetKind, RetrievalResponseState,
     StepListState, WorkingAnswerState,

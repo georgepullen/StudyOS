@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{
     AppConfig, AppStats,
     content::{
@@ -86,7 +88,7 @@ impl DeadlineUrgency {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPlanSummary {
     pub recommended_duration_minutes: u16,
     pub why_now: String,
