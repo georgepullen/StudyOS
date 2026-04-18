@@ -45,10 +45,54 @@ pub struct TutorQuestion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TutorCorrectness {
+    Correct,
+    Partial,
+    Incorrect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TutorReasoningQuality {
+    Strong,
+    Adequate,
+    Weak,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TutorErrorType {
+    ConceptualMisunderstanding,
+    ProceduralSlip,
+    NotationError,
+    ArithmeticError,
+    IncompleteJustification,
+    WeakReasoning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TutorMisconception {
+    pub error_type: TutorErrorType,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TutorEvaluation {
+    pub correctness: TutorCorrectness,
+    pub reasoning_quality: TutorReasoningQuality,
+    pub feedback_summary: String,
+    pub misconception: Option<TutorMisconception>,
+    pub outcome_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TutorTurnPayload {
     pub session_plan: Option<SessionPlanSummary>,
     pub teaching_blocks: Vec<TutorBlock>,
     pub question: Option<TutorQuestion>,
+    pub evaluation: Option<TutorEvaluation>,
 }
 
 impl TutorTurnPayload {
@@ -119,6 +163,7 @@ mod tests {
                 concept_tags: vec!["matrix multiplication".to_string()],
                 widget_kind: ResponseWidgetKind::RetrievalResponse,
             }),
+            evaluation: None,
         };
 
         let blocks = payload.into_content_blocks();

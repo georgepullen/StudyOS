@@ -27,12 +27,14 @@ pub fn run(mut app: App) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_loop(&mut terminal, &mut app);
+    let finish_result = app.finish_session();
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    result
+    result?;
+    finish_result
 }
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {

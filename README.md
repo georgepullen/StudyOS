@@ -92,7 +92,7 @@ This repository now has the first end-to-end tutor loop wired up:
 4. request a schema-constrained opening study step
 5. render the returned teaching blocks and structured question
 6. submit a structured answer for grading and the next question
-7. persist local resume state in SQLite
+7. persist local resume state, session records, attempts, and misconceptions in SQLite
 
 Detailed V1 implementation docs live in:
 

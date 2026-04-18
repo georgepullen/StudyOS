@@ -1,4 +1,8 @@
-use std::path::Path;
+use std::{
+    hash::{Hash, Hasher},
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,6 +24,50 @@ pub struct ResumeStateRecord {
     pub focused_panel: String,
     pub draft_payload: String,
     pub scratchpad_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub id: String,
+    pub planned_minutes: u16,
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptRecord {
+    pub id: String,
+    pub session_id: String,
+    pub concept_id: String,
+    pub question_type: String,
+    pub prompt_hash: String,
+    pub student_answer: String,
+    pub correctness: String,
+    pub latency_ms: i64,
+    pub reasoning_quality: String,
+    pub feedback_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MisconceptionInput {
+    pub concept_id: String,
+    pub error_type: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueReviewSummary {
+    pub concept_id: String,
+    pub concept_name: String,
+    pub next_review_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MisconceptionSummary {
+    pub concept_name: String,
+    pub error_type: String,
+    pub description: String,
+    pub last_seen_at: String,
+    pub evidence_count: usize,
 }
 
 pub struct AppDatabase {
@@ -110,11 +158,311 @@ impl AppDatabase {
         Ok(())
     }
 
+    pub fn start_session(&self, record: &SessionRecord) -> Result<()> {
+        self.connection.execute(
+            "
+            INSERT INTO sessions (id, started_at, planned_minutes, mode)
+            VALUES (?1, datetime('now'), ?2, ?3)
+            ON CONFLICT(id) DO NOTHING
+            ",
+            params![record.id, record.planned_minutes, record.mode],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_session(
+        &self,
+        session_id: &str,
+        actual_minutes: i64,
+        outcome_summary: &str,
+        aborted_reason: Option<&str>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "
+            UPDATE sessions
+            SET ended_at = datetime('now'),
+                actual_minutes = ?2,
+                outcome_summary = ?3,
+                aborted_reason = ?4
+            WHERE id = ?1
+            ",
+            params![session_id, actual_minutes, outcome_summary, aborted_reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_attempt(
+        &self,
+        attempt: &AttemptRecord,
+        misconception: Option<&MisconceptionInput>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "
+            INSERT INTO attempts (
+                id, session_id, concept_id, question_type, prompt_hash, student_answer,
+                correctness, latency_ms, reasoning_quality, feedback_summary
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                attempt.id,
+                attempt.session_id,
+                attempt.concept_id,
+                attempt.question_type,
+                attempt.prompt_hash,
+                attempt.student_answer,
+                attempt.correctness,
+                attempt.latency_ms,
+                attempt.reasoning_quality,
+                attempt.feedback_summary,
+            ],
+        )?;
+
+        self.ensure_concept_state(&attempt.concept_id)?;
+        self.update_concept_state(attempt)?;
+
+        if let Some(misconception) = misconception {
+            self.upsert_misconception(misconception)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn resolve_concept_id(&self, candidates: &[String]) -> Result<Option<String>> {
+        for candidate in candidates {
+            let resolved = self
+                .connection
+                .query_row(
+                    "
+                    SELECT id
+                    FROM concepts
+                    WHERE lower(id) = lower(?1)
+                       OR lower(name) = lower(?1)
+                       OR lower(tags) LIKE '%' || lower(?1) || '%'
+                    LIMIT 1
+                    ",
+                    params![candidate],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+
+            if resolved.is_some() {
+                return Ok(resolved);
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn list_due_reviews(&self, limit: usize) -> Result<Vec<DueReviewSummary>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT concepts.id, concepts.name, concept_state.next_review_at
+            FROM concept_state
+            INNER JOIN concepts ON concepts.id = concept_state.concept_id
+            WHERE concept_state.next_review_at IS NOT NULL
+            ORDER BY
+                CASE
+                    WHEN concept_state.next_review_at <= datetime('now') THEN 0
+                    ELSE 1
+                END,
+                concept_state.next_review_at ASC
+            LIMIT ?1
+            ",
+        )?;
+
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(DueReviewSummary {
+                concept_id: row.get(0)?,
+                concept_name: row.get(1)?,
+                next_review_at: row.get(2)?,
+            })
+        })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
+    pub fn list_recent_misconceptions(&self, limit: usize) -> Result<Vec<MisconceptionSummary>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT concepts.name, misconceptions.error_type, misconceptions.description,
+                   misconceptions.last_seen_at, misconceptions.evidence_count
+            FROM misconceptions
+            INNER JOIN concepts ON concepts.id = misconceptions.concept_id
+            WHERE misconceptions.resolved_at IS NULL
+            ORDER BY misconceptions.last_seen_at DESC
+            LIMIT ?1
+            ",
+        )?;
+
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(MisconceptionSummary {
+                concept_name: row.get(0)?,
+                error_type: row.get(1)?,
+                description: row.get(2)?,
+                last_seen_at: row.get(3)?,
+                evidence_count: row.get::<_, i64>(4)? as usize,
+            })
+        })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
     fn count_query(&self, sql: &str) -> Result<usize> {
         let count = self
             .connection
             .query_row(sql, [], |row| row.get::<_, i64>(0))?;
         Ok(count as usize)
+    }
+
+    fn ensure_concept_state(&self, concept_id: &str) -> Result<()> {
+        self.connection.execute(
+            "
+            INSERT INTO concept_state (concept_id)
+            VALUES (?1)
+            ON CONFLICT(concept_id) DO NOTHING
+            ",
+            params![concept_id],
+        )?;
+        Ok(())
+    }
+
+    fn update_concept_state(&self, attempt: &AttemptRecord) -> Result<()> {
+        let (current_mastery, current_retrieval, current_stability, current_ease) =
+            self.connection.query_row(
+                "
+                SELECT mastery_estimate, retrieval_strength, stability_days, ease_factor
+                FROM concept_state
+                WHERE concept_id = ?1
+                ",
+                params![attempt.concept_id],
+                |row| {
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, f64>(3)?,
+                    ))
+                },
+            )?;
+
+        let (mastery_delta, retrieval_delta, stability_delta, ease_delta, review_modifier, success) =
+            match (
+                attempt.correctness.as_str(),
+                attempt.reasoning_quality.as_str(),
+            ) {
+                ("correct", "strong") => (0.18, 0.22, 2.0, 0.06, "+5 day", true),
+                ("correct", "adequate") => (0.12, 0.16, 1.2, 0.03, "+3 day", true),
+                ("correct", _) => (0.07, 0.08, 0.6, 0.0, "+1 day", true),
+                ("partial", "adequate") => (0.03, -0.02, 0.2, -0.04, "+12 hour", false),
+                ("partial", _) => (0.01, -0.05, 0.0, -0.06, "+8 hour", false),
+                (_, _) => (-0.08, -0.14, -0.4, -0.1, "+4 hour", false),
+            };
+
+        let mastery_estimate = clamp(current_mastery + mastery_delta, 0.0, 1.0);
+        let retrieval_strength = clamp(current_retrieval + retrieval_delta, 0.0, 1.0);
+        let stability_days = clamp(current_stability + stability_delta, 0.0, 60.0);
+        let ease_factor = clamp(current_ease + ease_delta, 1.3, 3.0);
+        let success_timestamp = if success {
+            Some("datetime('now')")
+        } else {
+            None
+        };
+        let failure_timestamp = if success {
+            None
+        } else {
+            Some("datetime('now')")
+        };
+
+        self.connection.execute(
+            &format!(
+                "
+                UPDATE concept_state
+                SET mastery_estimate = ?2,
+                    retrieval_strength = ?3,
+                    last_seen_at = datetime('now'),
+                    last_success_at = {},
+                    last_failure_at = {},
+                    next_review_at = datetime('now', ?4),
+                    stability_days = ?5,
+                    ease_factor = ?6
+                WHERE concept_id = ?1
+                ",
+                success_timestamp.unwrap_or("last_success_at"),
+                failure_timestamp.unwrap_or("last_failure_at"),
+            ),
+            params![
+                attempt.concept_id,
+                mastery_estimate,
+                retrieval_strength,
+                review_modifier,
+                stability_days,
+                ease_factor,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    fn upsert_misconception(&self, misconception: &MisconceptionInput) -> Result<()> {
+        let existing = self
+            .connection
+            .query_row(
+                "
+                SELECT id
+                FROM misconceptions
+                WHERE concept_id = ?1
+                  AND error_type = ?2
+                  AND description = ?3
+                  AND resolved_at IS NULL
+                ORDER BY last_seen_at DESC
+                LIMIT 1
+                ",
+                params![
+                    misconception.concept_id,
+                    misconception.error_type,
+                    misconception.description
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        if let Some(id) = existing {
+            self.connection.execute(
+                "
+                UPDATE misconceptions
+                SET last_seen_at = datetime('now'),
+                    evidence_count = evidence_count + 1
+                WHERE id = ?1
+                ",
+                params![id],
+            )?;
+        } else {
+            self.connection.execute(
+                "
+                INSERT INTO misconceptions (
+                    id, concept_id, error_type, description, first_seen_at, last_seen_at, resolved_at, evidence_count
+                )
+                VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'), NULL, 1)
+                ",
+                params![
+                    make_record_id("misconception", &misconception.description),
+                    misconception.concept_id,
+                    misconception.error_type,
+                    misconception.description,
+                ],
+            )?;
+        }
+
+        Ok(())
     }
 
     fn initialize_schema(&self) -> Result<()> {
@@ -261,11 +609,26 @@ impl AppDatabase {
     }
 }
 
+fn make_record_id(prefix: &str, seed: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    let seed_hash = hasher.finish();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{prefix}-{nanos:x}-{seed_hash:x}")
+}
+
+fn clamp(value: f64, min: f64, max: f64) -> f64 {
+    value.max(min).min(max)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{env, fs};
 
-    use super::{AppDatabase, ResumeStateRecord};
+    use super::{AppDatabase, AttemptRecord, MisconceptionInput, ResumeStateRecord, SessionRecord};
 
     fn temp_db_dir() -> std::path::PathBuf {
         let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -328,6 +691,68 @@ mod tests {
             assert_eq!(loaded.runtime_thread_id, record.runtime_thread_id);
             assert_eq!(loaded.focused_panel, record.focused_panel);
             assert_eq!(loaded.scratchpad_text, record.scratchpad_text);
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn attempt_logging_updates_reviews_and_misconceptions() {
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        {
+            let database = AppDatabase::open(&path)
+                .unwrap_or_else(|err| panic!("database open failed: {err}"));
+
+            database
+                .start_session(&SessionRecord {
+                    id: "session-1".to_string(),
+                    planned_minutes: 45,
+                    mode: "Study".to_string(),
+                })
+                .unwrap_or_else(|err| panic!("session start failed: {err}"));
+
+            database
+                .record_attempt(
+                    &AttemptRecord {
+                        id: "attempt-1".to_string(),
+                        session_id: "session-1".to_string(),
+                        concept_id: "matrix_multiplication_dims".to_string(),
+                        question_type: "retrieval_response".to_string(),
+                        prompt_hash: "abc123".to_string(),
+                        student_answer: "rows and columns mismatched".to_string(),
+                        correctness: "incorrect".to_string(),
+                        latency_ms: 1200,
+                        reasoning_quality: "missing".to_string(),
+                        feedback_summary: "You mixed up inner and outer dimensions.".to_string(),
+                    },
+                    Some(&MisconceptionInput {
+                        concept_id: "matrix_multiplication_dims".to_string(),
+                        error_type: "conceptual_misunderstanding".to_string(),
+                        description: "Confused inner and outer dimensions.".to_string(),
+                    }),
+                )
+                .unwrap_or_else(|err| panic!("attempt record failed: {err}"));
+
+            let reviews = database
+                .list_due_reviews(5)
+                .unwrap_or_else(|err| panic!("due review query failed: {err}"));
+            let misconceptions = database
+                .list_recent_misconceptions(5)
+                .unwrap_or_else(|err| panic!("misconception query failed: {err}"));
+            let stats = database
+                .stats()
+                .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+
+            assert_eq!(stats.total_attempts, 1);
+            assert_eq!(stats.total_sessions, 1);
+            assert!(!reviews.is_empty());
+            assert_eq!(reviews[0].concept_id, "matrix_multiplication_dims");
+            assert_eq!(misconceptions.len(), 1);
+            assert_eq!(
+                misconceptions[0].error_type,
+                "conceptual_misunderstanding".to_string()
+            );
         }
 
         let _ = fs::remove_dir_all(dir);

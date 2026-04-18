@@ -18,8 +18,14 @@ pub use session::{
     ActivityItem, ActivityStatus, AppSnapshot, DeadlineUrgency, KeybindingHint, PanelTab,
     SessionMetrics, SessionMode, SessionPlanSummary,
 };
-pub use store::{AppDatabase, AppStats, ResumeStateRecord};
-pub use tutor::{TutorBlock, TutorQuestion, TutorTurnPayload};
+pub use store::{
+    AppDatabase, AppStats, AttemptRecord, DueReviewSummary, MisconceptionInput,
+    MisconceptionSummary, ResumeStateRecord, SessionRecord,
+};
+pub use tutor::{
+    TutorBlock, TutorCorrectness, TutorErrorType, TutorEvaluation, TutorMisconception,
+    TutorQuestion, TutorReasoningQuality, TutorTurnPayload,
+};
 pub use widgets::{
     MatrixDimensions, MatrixGridState, ResponseWidget, ResponseWidgetKind, RetrievalResponseState,
     StepListState, WorkingAnswerState,

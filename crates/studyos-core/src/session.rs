@@ -189,8 +189,8 @@ impl AppSnapshot {
                 },
                 ActivityItem {
                     name: "App-server".to_string(),
-                    detail: "Runtime integration not wired yet; shell is running in local bootstrap mode.".to_string(),
-                    status: ActivityStatus::Idle,
+                    detail: "Codex app-server bootstrap is pending; live tutor content will replace this shell once the first turn completes.".to_string(),
+                    status: ActivityStatus::Running,
                 },
                 ActivityItem {
                     name: "Renderer".to_string(),
@@ -227,7 +227,7 @@ fn bootstrap_transcript() -> Vec<ContentBlock> {
             text: "StudyOS V1 Shell".to_string(),
         }),
         ContentBlock::Paragraph(ParagraphBlock {
-            text: "This bootstrap run establishes the terminal shell, local study memory, and the first structured answer widget. The full Codex app-server loop will plug into this transcript next.".to_string(),
+            text: "This bootstrap view appears while the local tutor runtime connects. Once the first structured Codex turn returns, it replaces this placeholder with live study content.".to_string(),
         }),
         ContentBlock::WarningBox(WarningBox {
             title: "Attempt-First Default".to_string(),

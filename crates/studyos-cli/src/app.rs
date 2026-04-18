@@ -1,13 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    time::Instant,
+};
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Value, json};
 use studyos_core::{
     ActivityItem, ActivityStatus, AppConfig, AppDatabase, AppPaths, AppSnapshot, AppStats,
-    ContentBlock, LocalContext, MatrixGridState, PanelTab, ResponseWidget, ResponseWidgetKind,
-    ResumeStateRecord, RetrievalResponseState, SessionMode, StepListState, TutorTurnPayload,
-    WarningBox, WorkingAnswerState,
+    AttemptRecord, ContentBlock, LocalContext, MatrixGridState, MisconceptionInput, PanelTab,
+    ResponseWidget, ResponseWidgetKind, ResumeStateRecord, RetrievalResponseState, SessionMode,
+    SessionRecord, StepListState, TutorCorrectness, TutorErrorType, TutorEvaluation,
+    TutorReasoningQuality, TutorTurnPayload, WarningBox, WorkingAnswerState,
 };
 
 use crate::runtime::{AppServerClient, RuntimeEvent};
@@ -56,6 +61,22 @@ pub struct AppBootstrap {
     pub resume_state: Option<ResumeStateRecord>,
 }
 
+#[derive(Clone)]
+struct PendingAttemptContext {
+    question_title: String,
+    question_prompt: String,
+    concept_tags: Vec<String>,
+    widget_kind: ResponseWidgetKind,
+    student_answer: String,
+    latency_ms: i64,
+}
+
+#[derive(Clone)]
+struct PendingTurn {
+    display_user_text: Option<String>,
+    attempt: Option<PendingAttemptContext>,
+}
+
 pub struct App {
     pub database: AppDatabase,
     pub paths: AppPaths,
@@ -73,9 +94,14 @@ pub struct App {
     runtime_thread_id: Option<String>,
     runtime_ready: bool,
     runtime_bootstrap_applied: bool,
-    pending_structured_turns: HashSet<String>,
+    pending_structured_turns: HashMap<String, PendingTurn>,
     live_message_indices: HashMap<String, usize>,
     structured_buffers: HashMap<String, String>,
+    question_presented_at: HashMap<usize, Instant>,
+    current_session_id: String,
+    session_started_at: Instant,
+    session_finished: bool,
+    session_outcomes: Vec<String>,
 }
 
 impl App {
@@ -105,6 +131,12 @@ impl App {
                 Some((*index, default_widget_state(card.widget_kind)))
             })
             .collect();
+        let question_presented_at = question_indices
+            .iter()
+            .map(|index| (*index, Instant::now()))
+            .collect();
+
+        let session_seed = config.default_course.clone();
 
         let mut app = Self {
             database,
@@ -123,9 +155,14 @@ impl App {
             runtime_thread_id: None,
             runtime_ready: false,
             runtime_bootstrap_applied: false,
-            pending_structured_turns: HashSet::new(),
+            pending_structured_turns: HashMap::new(),
             live_message_indices: HashMap::new(),
             structured_buffers: HashMap::new(),
+            question_presented_at,
+            current_session_id: make_id("session", &session_seed),
+            session_started_at: Instant::now(),
+            session_finished: false,
+            session_outcomes: Vec::new(),
         };
 
         if let Some(resume) = resume_state {
@@ -159,6 +196,22 @@ impl App {
                 "App-server",
                 "Codex app-server unavailable; shell is running in local fallback mode."
                     .to_string(),
+                ActivityStatus::Idle,
+            ),
+        }
+
+        match app
+            .start_session_record()
+            .and_then(|_| app.refresh_snapshot_metrics())
+        {
+            Ok(()) => app.set_activity(
+                "SQLite",
+                "Local study memory opened, session recorded, and metrics refreshed.".to_string(),
+                ActivityStatus::Healthy,
+            ),
+            Err(error) => app.set_activity(
+                "SQLite",
+                format!("Failed to start session record: {error}"),
                 ActivityStatus::Idle,
             ),
         }
@@ -197,7 +250,13 @@ impl App {
                 tutor_output_schema(),
                 cwd,
             )?;
-            self.pending_structured_turns.insert(turn_id);
+            self.pending_structured_turns.insert(
+                turn_id,
+                PendingTurn {
+                    display_user_text: None,
+                    attempt: None,
+                },
+            );
         }
 
         self.set_activity(
@@ -300,6 +359,30 @@ impl App {
         }
     }
 
+    pub fn finish_session(&mut self) -> Result<()> {
+        if self.session_finished {
+            return Ok(());
+        }
+
+        let actual_minutes = (self.session_started_at.elapsed().as_secs() / 60) as i64;
+        let outcome_summary = if self.session_outcomes.is_empty() {
+            "Session ended before any graded evidence was captured.".to_string()
+        } else {
+            self.session_outcomes.join(" | ")
+        };
+
+        self.database.complete_session(
+            &self.current_session_id,
+            actual_minutes,
+            &outcome_summary,
+            None,
+        )?;
+        self.session_finished = true;
+        self.refresh_snapshot_metrics()?;
+        self.persist_resume_state()?;
+        Ok(())
+    }
+
     pub fn active_widget(&self) -> Option<&ResponseWidget> {
         self.widget_states.get(&self.active_question_index)
     }
@@ -375,25 +458,47 @@ impl App {
     }
 
     pub fn misconceptions_summary(&self) -> Vec<String> {
-        let mut lines = vec![
-            "No misconception history yet; future sessions will persist repeated errors here."
-                .to_string(),
-            "Determinant-zero confusion should escalate into prerequisite repair mode.".to_string(),
-        ];
-
-        for course in self.local_context.courses.courses.iter().take(2) {
-            lines.push(format!("Loaded course graph: {}", course.title));
+        match self.database.list_recent_misconceptions(4) {
+            Ok(entries) if !entries.is_empty() => {
+                let mut lines = vec!["Recent recurring misconceptions:".to_string()];
+                for entry in entries {
+                    lines.push(format!(
+                        "• {} [{}] x{}",
+                        entry.concept_name, entry.error_type, entry.evidence_count
+                    ));
+                    lines.push(format!("  {}", entry.description));
+                }
+                lines
+            }
+            Ok(_) => vec![
+                "No misconception history yet; repeated errors will accumulate here.".to_string(),
+            ],
+            Err(error) => vec![format!("Misconception summary unavailable: {error}")],
         }
-
-        lines
     }
 
     pub fn review_summary(&self) -> Vec<String> {
-        vec![
-            format!("Due review count: {}", self.snapshot.metrics.due_reviews),
-            "Warm-up queue starts with matrix dimension rules.".to_string(),
-            "Transfer prompts should follow quick correct answers.".to_string(),
-        ]
+        match self.database.list_due_reviews(4) {
+            Ok(reviews) if !reviews.is_empty() => {
+                let mut lines = vec![format!(
+                    "Due review count: {}",
+                    self.snapshot.metrics.due_reviews
+                )];
+                for review in reviews {
+                    lines.push(format!(
+                        "• {} due {}",
+                        review.concept_name, review.next_review_at
+                    ));
+                }
+                lines
+            }
+            Ok(_) => vec![
+                format!("Due review count: {}", self.snapshot.metrics.due_reviews),
+                "No due retrieval items yet; correct answers will schedule future reviews."
+                    .to_string(),
+            ],
+            Err(error) => vec![format!("Review queue unavailable: {error}")],
+        }
     }
 
     pub fn deadline_summary(&self) -> Vec<String> {
@@ -435,7 +540,37 @@ impl App {
         }
     }
 
+    fn start_session_record(&mut self) -> Result<()> {
+        let record = SessionRecord {
+            id: self.current_session_id.clone(),
+            planned_minutes: self.snapshot.time_remaining_minutes,
+            mode: self.snapshot.mode.label().to_string(),
+        };
+        self.database.start_session(&record)
+    }
+
+    fn refresh_snapshot_metrics(&mut self) -> Result<()> {
+        let mut stats = self.database.stats()?;
+        stats.upcoming_deadlines = self.local_context.upcoming_deadline_count();
+        self.stats = stats.clone();
+        self.snapshot.metrics.due_reviews = stats.due_reviews;
+        self.snapshot.metrics.upcoming_deadlines = stats.upcoming_deadlines;
+        self.snapshot.metrics.attempts_logged = stats.total_attempts;
+        self.snapshot.metrics.sessions_logged = stats.total_sessions;
+        self.snapshot.deadline_urgency = if stats.upcoming_deadlines > 0 {
+            studyos_core::DeadlineUrgency::Upcoming
+        } else {
+            studyos_core::DeadlineUrgency::Calm
+        };
+        Ok(())
+    }
+
     fn submit_current_answer(&mut self) -> Result<()> {
+        if let Some(warning) = self.active_widget().and_then(widget_validation_warning) {
+            self.push_block(ContentBlock::WarningBox(warning));
+            return Ok(());
+        }
+
         let runtime = self
             .runtime
             .as_ref()
@@ -445,10 +580,17 @@ impl App {
             .clone()
             .ok_or_else(|| anyhow!("no runtime thread is active"))?;
         let prompt = self.build_submission_prompt();
+        let attempt = self.build_pending_attempt_context();
         let cwd = self.paths.root_dir.parent().unwrap_or(&self.paths.root_dir);
         let turn_id =
             runtime.start_structured_turn(&thread_id, &prompt, tutor_output_schema(), cwd)?;
-        self.pending_structured_turns.insert(turn_id);
+        self.pending_structured_turns.insert(
+            turn_id,
+            PendingTurn {
+                display_user_text: Some(format!("Submitted answer: {}", attempt.question_title)),
+                attempt: Some(attempt),
+            },
+        );
         self.set_activity(
             "App-server",
             "Submitted structured student answer for grading and next-step planning.".to_string(),
@@ -478,6 +620,22 @@ impl App {
             .map(|course| course.title.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        let due_review_concepts = self
+            .database
+            .list_due_reviews(3)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|review| review.concept_name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let misconceptions = self
+            .database
+            .list_recent_misconceptions(3)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| format!("{}: {}", item.concept_name, item.description))
+            .collect::<Vec<_>>()
+            .join("; ");
 
         format!(
             "You are the StudyOS tutor runtime. Return JSON matching the provided schema only.\n\
@@ -487,12 +645,15 @@ impl App {
             Due review count: {due_reviews}\n\
             Upcoming deadlines: {deadlines}\n\
             Local courses loaded: {course_names}\n\
+            Due review concepts: {due_review_concepts}\n\
+            Recent misconceptions: {misconceptions}\n\
             Strictness: {:?}\n\
             Requirements:\n\
             - retrieval first, not explanation first\n\
             - one short session plan\n\
             - 1 to 3 teaching blocks max before the question\n\
             - exactly one active question using one of the supported widgets\n\
+            - evaluation must be null on this opening turn\n\
             - prefer matrix_grid for matrix algebra warmups when appropriate\n\
             - keep the tone direct and anti-passive",
             self.config.strictness,
@@ -501,6 +662,16 @@ impl App {
             due_reviews = self.snapshot.metrics.due_reviews,
             deadlines = deadlines,
             course_names = course_names,
+            due_review_concepts = if due_review_concepts.is_empty() {
+                "none".to_string()
+            } else {
+                due_review_concepts
+            },
+            misconceptions = if misconceptions.is_empty() {
+                "none".to_string()
+            } else {
+                misconceptions
+            },
         )
     }
 
@@ -523,6 +694,7 @@ impl App {
             - if the answer is weak, repair the misconception before novelty\n\
             - if the answer is correct, ask one transfer or explanation question next\n\
             - keep the session plan short and updated\n\
+            - include evaluation with correctness, reasoning_quality, feedback_summary, and misconception when warranted\n\
             - provide exactly one next active question",
             self.snapshot.mode.label(),
             title,
@@ -580,6 +752,85 @@ impl App {
         }
     }
 
+    fn build_pending_attempt_context(&self) -> PendingAttemptContext {
+        let question = self.snapshot.transcript.get(self.active_question_index);
+        let (question_title, question_prompt, concept_tags, widget_kind) = match question {
+            Some(ContentBlock::QuestionCard(card)) => (
+                card.title.clone(),
+                card.prompt.clone(),
+                card.concept_tags.clone(),
+                card.widget_kind,
+            ),
+            _ => (
+                self.active_question_title(),
+                self.active_question_prompt()
+                    .unwrap_or_else(|| "No prompt recorded.".to_string()),
+                Vec::new(),
+                self.active_widget()
+                    .map(ResponseWidget::kind)
+                    .unwrap_or(ResponseWidgetKind::RetrievalResponse),
+            ),
+        };
+
+        let latency_ms = self
+            .question_presented_at
+            .get(&self.active_question_index)
+            .map(|started| started.elapsed().as_millis() as i64)
+            .unwrap_or(0);
+
+        PendingAttemptContext {
+            question_title,
+            question_prompt,
+            concept_tags,
+            widget_kind,
+            student_answer: self.widget_submission_summary(),
+            latency_ms,
+        }
+    }
+
+    fn persist_evaluation(
+        &mut self,
+        context: &PendingAttemptContext,
+        evaluation: &TutorEvaluation,
+    ) -> Result<()> {
+        let concept_id = self.resolve_concept_id(&context.concept_tags);
+        let correctness = correctness_label(&evaluation.correctness);
+        let reasoning_quality = reasoning_quality_label(&evaluation.reasoning_quality);
+        let feedback_summary = evaluation.feedback_summary.trim().to_string();
+        let prompt_hash = stable_hash(&context.question_prompt);
+        let attempt = AttemptRecord {
+            id: make_id("attempt", &context.question_prompt),
+            session_id: self.current_session_id.clone(),
+            concept_id: concept_id.clone(),
+            question_type: widget_kind_label(context.widget_kind).to_string(),
+            prompt_hash,
+            student_answer: context.student_answer.clone(),
+            correctness: correctness.to_string(),
+            latency_ms: context.latency_ms,
+            reasoning_quality: reasoning_quality.to_string(),
+            feedback_summary: feedback_summary.clone(),
+        };
+
+        let misconception = evaluation
+            .misconception
+            .as_ref()
+            .map(|item| MisconceptionInput {
+                concept_id,
+                error_type: error_type_label(&item.error_type).to_string(),
+                description: item.description.clone(),
+            });
+
+        self.database
+            .record_attempt(&attempt, misconception.as_ref())?;
+        let outcome = evaluation
+            .outcome_summary
+            .clone()
+            .unwrap_or_else(|| format!("{}: {}", context.question_title, feedback_summary));
+        self.session_outcomes.push(outcome.clone());
+        self.set_activity("Evidence", outcome, ActivityStatus::Healthy);
+        Ok(())
+    }
+
     fn handle_runtime_event(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::ThreadReady { thread_id } => {
@@ -610,7 +861,9 @@ impl App {
                 );
             }
             RuntimeEvent::TurnCompleted { turn_id, status } => {
-                self.pending_structured_turns.remove(&turn_id);
+                if status == "failed" {
+                    self.pending_structured_turns.remove(&turn_id);
+                }
                 self.set_activity(
                     "App-server",
                     format!("Turn completed with status: {status}"),
@@ -625,7 +878,7 @@ impl App {
                 item_id,
                 delta,
             } => {
-                if self.pending_structured_turns.contains(&turn_id) {
+                if self.pending_structured_turns.contains_key(&turn_id) {
                     self.structured_buffers
                         .entry(item_id)
                         .or_default()
@@ -680,7 +933,7 @@ impl App {
             .unwrap_or("")
             .to_string();
 
-        if item_type == "agentMessage" && !self.pending_structured_turns.contains(turn_id) {
+        if item_type == "agentMessage" && !self.pending_structured_turns.contains_key(turn_id) {
             let index = self.snapshot.transcript.len();
             self.snapshot
                 .transcript
@@ -691,7 +944,7 @@ impl App {
             return;
         }
 
-        if item_type == "agentMessage" && self.pending_structured_turns.contains(turn_id) {
+        if item_type == "agentMessage" && self.pending_structured_turns.contains_key(turn_id) {
             self.set_activity(
                 "Tutor turn",
                 "Streaming structured tutor payload...".to_string(),
@@ -704,13 +957,20 @@ impl App {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
         match item_type {
             "userMessage" => {
-                if let Some(text) = item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .and_then(|content| content.first())
-                    .and_then(|entry| entry.get("text"))
-                    .and_then(Value::as_str)
-                {
+                let display_text = self
+                    .pending_structured_turns
+                    .get(turn_id)
+                    .and_then(|pending| pending.display_user_text.clone())
+                    .or_else(|| {
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .and_then(|content| content.first())
+                            .and_then(|entry| entry.get("text"))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    });
+
+                if let Some(text) = display_text {
                     self.push_block(ContentBlock::Paragraph(studyos_core::ParagraphBlock {
                         text: format!("You: {text}"),
                     }));
@@ -728,9 +988,10 @@ impl App {
                     .unwrap_or("")
                     .to_string();
 
-                if self.pending_structured_turns.contains(turn_id) {
+                if self.pending_structured_turns.contains_key(turn_id) {
                     let structured_text = self.structured_buffers.remove(&item_id).unwrap_or(text);
-                    self.apply_structured_tutor_payload(&structured_text);
+                    self.apply_structured_tutor_payload(turn_id, &structured_text);
+                    self.pending_structured_turns.remove(turn_id);
                 } else if let Some(index) = self.live_message_indices.remove(&item_id) {
                     if let Some(ContentBlock::Paragraph(paragraph)) =
                         self.snapshot.transcript.get_mut(index)
@@ -754,9 +1015,25 @@ impl App {
         }
     }
 
-    fn apply_structured_tutor_payload(&mut self, raw: &str) {
+    fn apply_structured_tutor_payload(&mut self, turn_id: &str, raw: &str) {
         match serde_json::from_str::<TutorTurnPayload>(raw) {
             Ok(payload) => {
+                let evaluation_context = self
+                    .pending_structured_turns
+                    .get(turn_id)
+                    .and_then(|pending| pending.attempt.clone());
+
+                if let (Some(evaluation), Some(context)) =
+                    (payload.evaluation.as_ref(), evaluation_context.as_ref())
+                {
+                    if let Err(error) = self.persist_evaluation(context, evaluation) {
+                        self.push_block(ContentBlock::WarningBox(WarningBox {
+                            title: "Evidence logging failed".to_string(),
+                            body: error.to_string(),
+                        }));
+                    }
+                }
+
                 if let Some(plan) = payload.session_plan.clone() {
                     self.snapshot.plan = plan;
                 }
@@ -776,6 +1053,9 @@ impl App {
                 }
 
                 self.rebuild_widget_state_from(previous_len);
+                if let Err(error) = self.refresh_snapshot_metrics() {
+                    self.set_activity("SQLite", error.to_string(), ActivityStatus::Idle);
+                }
                 self.set_activity(
                     "Tutor turn",
                     "Structured tutor payload rendered successfully.".to_string(),
@@ -796,6 +1076,7 @@ impl App {
             if let Some(ContentBlock::QuestionCard(card)) = self.snapshot.transcript.get(index) {
                 self.widget_states
                     .insert(index, default_widget_state(card.widget_kind));
+                self.question_presented_at.insert(index, Instant::now());
                 self.active_question_index = index;
             }
         }
@@ -912,6 +1193,18 @@ impl App {
 
     fn developer_instructions(&self) -> String {
         "You are the StudyOS tutor runtime. Prioritize retrieval before explanation, ask for mathematical reasoning rather than spoon-feeding, and stay concise. When the client provides an output schema, obey it strictly. Prefer one active question at a time and choose widget kinds that match the task precisely.".to_string()
+    }
+
+    fn resolve_concept_id(&self, concept_tags: &[String]) -> String {
+        if let Ok(Some(concept_id)) = self.database.resolve_concept_id(concept_tags) {
+            return concept_id;
+        }
+
+        if let Some(first) = concept_tags.first() {
+            return normalize_identifier(first);
+        }
+
+        "general_study_skill".to_string()
     }
 
     fn apply_resume_state(&mut self, resume: ResumeStateRecord) {
@@ -1106,6 +1399,70 @@ pub fn widget_validation_warning(widget: &ResponseWidget) -> Option<WarningBox> 
     }
 }
 
+fn widget_kind_label(kind: ResponseWidgetKind) -> &'static str {
+    match kind {
+        ResponseWidgetKind::MatrixGrid => "matrix_grid",
+        ResponseWidgetKind::WorkingAnswer => "working_answer",
+        ResponseWidgetKind::StepList => "step_list",
+        ResponseWidgetKind::RetrievalResponse => "retrieval_response",
+    }
+}
+
+fn correctness_label(correctness: &TutorCorrectness) -> &'static str {
+    match correctness {
+        TutorCorrectness::Correct => "correct",
+        TutorCorrectness::Partial => "partial",
+        TutorCorrectness::Incorrect => "incorrect",
+    }
+}
+
+fn reasoning_quality_label(reasoning_quality: &TutorReasoningQuality) -> &'static str {
+    match reasoning_quality {
+        TutorReasoningQuality::Strong => "strong",
+        TutorReasoningQuality::Adequate => "adequate",
+        TutorReasoningQuality::Weak => "weak",
+        TutorReasoningQuality::Missing => "missing",
+    }
+}
+
+fn error_type_label(error_type: &TutorErrorType) -> &'static str {
+    match error_type {
+        TutorErrorType::ConceptualMisunderstanding => "conceptual_misunderstanding",
+        TutorErrorType::ProceduralSlip => "procedural_slip",
+        TutorErrorType::NotationError => "notation_error",
+        TutorErrorType::ArithmeticError => "arithmetic_error",
+        TutorErrorType::IncompleteJustification => "incomplete_justification",
+        TutorErrorType::WeakReasoning => "weak_reasoning",
+    }
+}
+
+fn stable_hash(text: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+fn make_id(prefix: &str, seed: &str) -> String {
+    format!(
+        "{prefix}-{}",
+        stable_hash(&format!("{seed}-{:?}", Instant::now()))
+    )
+}
+
+fn normalize_identifier(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
 fn tutor_output_schema() -> Value {
     json!({
         "type": "object",
@@ -1156,9 +1513,51 @@ fn tutor_output_schema() -> Value {
                 },
                 "required": ["title", "prompt", "concept_tags", "widget_kind"],
                 "additionalProperties": false
+            },
+            "evaluation": {
+                "type": ["object", "null"],
+                "properties": {
+                    "correctness": {
+                        "type": "string",
+                        "enum": ["correct", "partial", "incorrect"]
+                    },
+                    "reasoning_quality": {
+                        "type": "string",
+                        "enum": ["strong", "adequate", "weak", "missing"]
+                    },
+                    "feedback_summary": { "type": "string" },
+                    "misconception": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "error_type": {
+                                "type": "string",
+                                "enum": [
+                                    "conceptual_misunderstanding",
+                                    "procedural_slip",
+                                    "notation_error",
+                                    "arithmetic_error",
+                                    "incomplete_justification",
+                                    "weak_reasoning"
+                                ]
+                            },
+                            "description": { "type": "string" }
+                        },
+                        "required": ["error_type", "description"],
+                        "additionalProperties": false
+                    },
+                    "outcome_summary": { "type": ["string", "null"] }
+                },
+                "required": [
+                    "correctness",
+                    "reasoning_quality",
+                    "feedback_summary",
+                    "misconception",
+                    "outcome_summary"
+                ],
+                "additionalProperties": false
             }
         },
-        "required": ["session_plan", "teaching_blocks", "question"],
+        "required": ["session_plan", "teaching_blocks", "question", "evaluation"],
         "additionalProperties": false
     })
 }
