@@ -6,21 +6,25 @@ use std::env;
 use std::fs;
 
 use crate::runtime::AppServerClient;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use app::{App, AppBootstrap};
 use studyos_core::{
-    AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, LocalContext,
-    StartupMisconceptionItem, StartupReviewItem,
+    AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, CourseCatalog,
+    DeadlineEntry, LocalContext, StartupMisconceptionItem, StartupReviewItem, load_deadlines,
+    upsert_deadline,
 };
 
 fn main() -> Result<()> {
     let cwd = env::current_dir()?;
     let paths = AppPaths::discover(&cwd);
-    let command = env::args().nth(1);
+    let args = env::args().collect::<Vec<_>>();
+    let command = args.get(1).map(String::as_str);
 
-    match command.as_deref() {
+    match command {
         Some("init") => run_init(&paths),
         Some("doctor") => run_doctor(&paths),
+        Some("deadlines") => run_deadlines(&paths, &args[2..]),
+        Some("courses") => run_courses(&paths, &args[2..]),
         _ => run_interactive(&paths),
     }
 }
@@ -186,6 +190,148 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
     Ok(())
 }
 
+fn run_deadlines(paths: &AppPaths, args: &[String]) -> Result<()> {
+    paths.ensure()?;
+
+    match args.first().map(String::as_str) {
+        Some("list") | None => run_deadlines_list(paths, &args[1.min(args.len())..]),
+        Some("add") => run_deadlines_add(paths, &args[1..]),
+        Some(other) => Err(anyhow!(
+            "unknown deadlines subcommand: {other}. Use `deadlines list` or `deadlines add`."
+        )),
+    }
+}
+
+fn run_courses(paths: &AppPaths, args: &[String]) -> Result<()> {
+    paths.ensure()?;
+
+    match args.first().map(String::as_str) {
+        Some("list") | None => run_courses_list(paths),
+        Some("use") => run_courses_use(paths, &args[1..]),
+        Some(other) => Err(anyhow!(
+            "unknown courses subcommand: {other}. Use `courses list` or `courses use`."
+        )),
+    }
+}
+
+fn run_courses_list(paths: &AppPaths) -> Result<()> {
+    let config = AppConfig::load_or_default(&paths.config_path)?;
+    let catalog = CourseCatalog::load(&paths.courses_dir)?;
+
+    if catalog.courses.is_empty() {
+        println!("No course files found in {}", paths.courses_dir.display());
+        return Ok(());
+    }
+
+    println!("StudyOS courses");
+    for course in catalog.courses {
+        let marker = if course.title == config.default_course {
+            "*"
+        } else {
+            "-"
+        };
+        println!(
+            "{marker} {} | topics {} | concepts {}",
+            course.title,
+            course.topics.len(),
+            course.concepts.len()
+        );
+    }
+
+    Ok(())
+}
+
+fn run_courses_use(paths: &AppPaths, args: &[String]) -> Result<()> {
+    let selected = required_option(args, "--title")?;
+    let catalog = CourseCatalog::load(&paths.courses_dir)?;
+    let known = catalog
+        .courses
+        .iter()
+        .any(|course| course.title.to_lowercase() == selected.to_lowercase());
+
+    if !known {
+        return Err(anyhow!(
+            "course not found: {selected}. Run `courses list` to inspect available titles."
+        ));
+    }
+
+    let mut config = AppConfig::load_or_default(&paths.config_path)?;
+    config.default_course = selected.clone();
+    config.save(&paths.config_path)?;
+
+    println!(
+        "Set default course to {} in {}.",
+        selected,
+        paths.config_path.display()
+    );
+    Ok(())
+}
+
+fn run_deadlines_list(paths: &AppPaths, args: &[String]) -> Result<()> {
+    let course_filter = option_value(args, "--course");
+    let mut deadlines = load_deadlines(&paths.deadlines_path)?;
+    if let Some(course) = course_filter {
+        let course = course.to_lowercase();
+        deadlines.retain(|deadline| deadline.course.to_lowercase() == course);
+    }
+
+    if deadlines.is_empty() {
+        println!(
+            "No local deadlines recorded at {}",
+            paths.deadlines_path.display()
+        );
+        return Ok(());
+    }
+
+    println!("StudyOS deadlines");
+    for deadline in deadlines {
+        println!(
+            "- {} | {} | {} | weight {:.2} | id {}",
+            deadline.due_at, deadline.course, deadline.title, deadline.weight, deadline.id
+        );
+        if !deadline.notes.trim().is_empty() {
+            println!("  notes: {}", deadline.notes);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_deadlines_add(paths: &AppPaths, args: &[String]) -> Result<()> {
+    let title = required_option(args, "--title")?;
+    let due_at = required_option(args, "--due-at")?;
+    let course = required_option(args, "--course")?;
+    let weight = option_value(args, "--weight")
+        .as_deref()
+        .unwrap_or("1.0")
+        .parse::<f32>()
+        .map_err(|error| anyhow!("invalid --weight value: {error}"))?;
+    let notes = option_value(args, "--notes").unwrap_or_default();
+    let source = option_value(args, "--source").unwrap_or_else(|| "manual".to_string());
+    let id = option_value(args, "--id").unwrap_or_else(|| deadline_id(&title, &due_at));
+
+    let deadlines = upsert_deadline(
+        &paths.deadlines_path,
+        DeadlineEntry {
+            id: id.clone(),
+            source,
+            title,
+            due_at,
+            course,
+            weight,
+            notes,
+        },
+    )?;
+
+    println!(
+        "Saved deadline {} to {} ({} total).",
+        id,
+        paths.deadlines_path.display(),
+        deadlines.len()
+    );
+    Ok(())
+}
+
 fn write_if_missing(path: &std::path::Path, contents: &str) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -201,4 +347,35 @@ fn write_if_missing(path: &std::path::Path, contents: &str) -> Result<()> {
 
 fn exists_flag(path: &std::path::Path) -> &'static str {
     if path.exists() { "present" } else { "missing" }
+}
+
+fn option_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find_map(|window| (window[0] == flag).then(|| window[1].clone()))
+}
+
+fn required_option(args: &[String], flag: &str) -> Result<String> {
+    option_value(args, flag).ok_or_else(|| anyhow!("missing required flag {flag}"))
+}
+
+fn deadline_id(title: &str, due_at: &str) -> String {
+    format!(
+        "{}-{}",
+        slug(title),
+        slug(due_at.split('T').next().unwrap_or(due_at))
+    )
+}
+
+fn slug(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }

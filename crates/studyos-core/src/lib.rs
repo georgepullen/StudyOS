@@ -13,7 +13,10 @@ pub use content::{
     RecapBox, WarningBox,
 };
 pub use course::{ConceptDefinition, CourseCatalog, CourseDefinition, TopicDefinition};
-pub use local_data::{DeadlineEntry, LocalContext, MaterialEntry, TimetableData, TimetableSlot};
+pub use local_data::{
+    DeadlineEntry, LocalContext, MaterialEntry, TimetableData, TimetableSlot, load_deadlines,
+    save_deadlines, upsert_deadline,
+};
 pub use session::{
     ActivityItem, ActivityStatus, AppSnapshot, BootstrapStudyContext, DeadlineUrgency,
     KeybindingHint, PanelTab, SessionMetrics, SessionMode, SessionPlanSummary, SessionRecapSummary,

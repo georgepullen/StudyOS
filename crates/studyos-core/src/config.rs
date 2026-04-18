@@ -85,6 +85,15 @@ impl AppConfig {
         let raw = fs::read_to_string(path)?;
         Ok(toml::from_str(&raw)?)
     }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::write(path, toml::to_string_pretty(self)?)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,5 +170,32 @@ mod tests {
         assert!(paths.materials_dir.exists());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_round_trips_config() {
+        let path = env::temp_dir().join(format!(
+            "studyos-config-roundtrip-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+
+        let config = AppConfig {
+            default_course: "Probability & Statistics for Scientists".to_string(),
+            ..AppConfig::default()
+        };
+
+        config
+            .save(&path)
+            .unwrap_or_else(|err| panic!("config save failed: {err}"));
+        let loaded = AppConfig::load_or_default(&path)
+            .unwrap_or_else(|err| panic!("config reload failed: {err}"));
+
+        assert_eq!(loaded.default_course, config.default_course);
+
+        let _ = fs::remove_file(path);
     }
 }

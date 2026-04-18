@@ -133,6 +133,25 @@ Inspect local setup health:
 cargo run -p studyos-cli -- doctor
 ```
 
+Manage local deadlines without hand-editing JSON:
+
+```bash
+cargo run -p studyos-cli -- deadlines list
+cargo run -p studyos-cli -- deadlines add \
+  --title "Mock Linear Exam" \
+  --due-at "2026-05-20T09:00:00Z" \
+  --course "Matrix Algebra & Linear Models" \
+  --weight 0.6 \
+  --notes "Manual local entry"
+```
+
+Inspect and switch the active course:
+
+```bash
+cargo run -p studyos-cli -- courses list
+cargo run -p studyos-cli -- courses use --title "Probability & Statistics for Scientists"
+```
+
 Example local data files live in:
 
 - [examples/studyos-config.toml](/Users/georgepullen/Documents/StudyOS/examples/studyos-config.toml)
