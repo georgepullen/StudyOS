@@ -92,6 +92,10 @@ This repository is currently in bootstrap stage. The first implementation steps 
 5. implement structured maths input widgets
 6. add SQLite-backed study memory
 
+Detailed V1 implementation docs live in:
+
+- [docs/implementation/README.md](/Users/georgepullen/Documents/StudyOS/docs/implementation/README.md)
+
 ## Quickstart
 
 Prerequisites:
