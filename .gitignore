@@ -1,0 +1,20 @@
+target/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local study data and generated runtime state
+.studyos/
+data/
+var/
+tmp/
+*.db
+*.db-shm
+*.db-wal
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
