@@ -1656,3 +1656,124 @@ fn tutor_recap_block_schema() -> Value {
         "additionalProperties": false
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{env, fs};
+
+    use studyos_core::{
+        AppConfig, AppDatabase, AppPaths, AppSnapshot, LocalContext, ResponseWidget,
+        ResponseWidgetKind, SessionPlanSummary, TutorBlock, TutorCorrectness, TutorErrorType,
+        TutorEvaluation, TutorMisconception, TutorQuestion, TutorReasoningQuality,
+        TutorTurnPayload,
+    };
+
+    use super::{App, AppBootstrap, PendingTurn};
+
+    fn temp_data_root() -> std::path::PathBuf {
+        let path = env::temp_dir().join(format!(
+            "studyos-app-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap_or_else(|err| panic!("temp dir create failed: {err}"));
+        path
+    }
+
+    #[test]
+    fn structured_payload_persists_attempt_evidence() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats);
+
+        let mut app = App::new(AppBootstrap {
+            database,
+            paths: paths.clone(),
+            config,
+            stats,
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: None,
+            runtime_error: None,
+            resume_state: None,
+        });
+
+        if let Some(ResponseWidget::MatrixGrid(state)) = app.active_widget_mut() {
+            state.cells[0][0] = "1".to_string();
+        }
+
+        let attempt = app.build_pending_attempt_context();
+        app.pending_structured_turns.insert(
+            "turn-test".to_string(),
+            PendingTurn {
+                display_user_text: Some("Submitted answer".to_string()),
+                attempt: Some(attempt),
+            },
+        );
+
+        let payload = TutorTurnPayload {
+            session_plan: Some(SessionPlanSummary {
+                recommended_duration_minutes: 10,
+                why_now: "Repair matrix product recall.".to_string(),
+                warm_up_questions: vec!["When is AB defined?".to_string()],
+                core_targets: vec!["Matrix multiplication dimensions".to_string()],
+                stretch_target: None,
+            }),
+            teaching_blocks: vec![TutorBlock::Paragraph {
+                text: "You mixed up the dimensions.".to_string(),
+            }],
+            question: Some(TutorQuestion {
+                title: "Dimension Repair".to_string(),
+                prompt: "State the inner-dimension rule.".to_string(),
+                concept_tags: vec!["matrix_multiplication".to_string()],
+                widget_kind: ResponseWidgetKind::RetrievalResponse,
+            }),
+            evaluation: Some(TutorEvaluation {
+                correctness: TutorCorrectness::Incorrect,
+                reasoning_quality: TutorReasoningQuality::Weak,
+                feedback_summary: "You entered only one cell and did not complete the product."
+                    .to_string(),
+                misconception: Some(TutorMisconception {
+                    error_type: TutorErrorType::ConceptualMisunderstanding,
+                    description: "Confused what product the grid was asking for.".to_string(),
+                }),
+                outcome_summary: Some("Matrix product recall needs repair.".to_string()),
+            }),
+        };
+
+        let raw = serde_json::to_string(&payload)
+            .unwrap_or_else(|err| panic!("payload serialization failed: {err}"));
+        app.apply_structured_tutor_payload("turn-test", &raw);
+
+        let stats = app
+            .database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let misconceptions = app
+            .database
+            .list_recent_misconceptions(5)
+            .unwrap_or_else(|err| panic!("misconception query failed: {err}"));
+
+        assert_eq!(stats.total_attempts, 1);
+        assert_eq!(misconceptions.len(), 1);
+        assert_eq!(
+            misconceptions[0].error_type,
+            "conceptual_misunderstanding".to_string()
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+}
