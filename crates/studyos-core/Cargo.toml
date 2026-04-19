@@ -12,8 +12,12 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0.102"
+pdf-extract = "0.10.0"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 time = { version = "0.3.44", features = ["formatting", "parsing", "local-offset"] }
 toml = "0.8.23"
+
+[dev-dependencies]
+proptest = "1.7.0"

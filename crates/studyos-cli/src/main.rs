@@ -1,37 +1,84 @@
-mod app;
-mod runtime;
-mod tui;
-
 use std::env;
 use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::runtime::AppServerClient;
 use anyhow::{Result, anyhow};
-use app::{App, AppBootstrap};
+use studyos_cli::{App, AppBootstrap, CodexAppServerTransport, tui};
 use studyos_core::{
     AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, CourseCatalog,
     DeadlineEntry, LocalContext, StartupMisconceptionItem, StartupReviewItem, TimetableSlot,
-    append_timetable_slot, load_deadlines, upsert_deadline,
+    append_timetable_slot, ingest_materials, load_deadlines, load_material_ingestion_status,
+    upsert_deadline,
 };
 
 fn main() -> Result<()> {
     let cwd = env::current_dir()?;
     let paths = AppPaths::discover(&cwd);
-    let args = env::args().collect::<Vec<_>>();
-    let command = args.get(1).map(String::as_str);
+    let cli = parse_cli_args(env::args().skip(1).collect())?;
+    let command = cli.command.as_deref();
 
     match command {
         Some("init") => run_init(&paths),
         Some("doctor") => run_doctor(&paths),
-        Some("deadlines") => run_deadlines(&paths, &args[2..]),
-        Some("courses") => run_courses(&paths, &args[2..]),
-        Some("materials") => run_materials(&paths, &args[2..]),
-        Some("timetable") => run_timetable(&paths, &args[2..]),
-        _ => run_interactive(&paths),
+        Some("tour") => run_tour(&paths),
+        Some("deadlines") => run_deadlines(&paths, &cli.rest),
+        Some("attempts") => run_attempts(&paths, &cli.rest),
+        Some("courses") => run_courses(&paths, &cli.rest),
+        Some("materials") => run_materials(&paths, &cli.rest),
+        Some("timetable") => run_timetable(&paths, &cli.rest),
+        _ => run_interactive(&paths, cli.log_json_path),
     }
 }
 
-fn run_interactive(paths: &AppPaths) -> Result<()> {
+struct CliArgs {
+    command: Option<String>,
+    rest: Vec<String>,
+    log_json_path: Option<PathBuf>,
+}
+
+fn parse_cli_args(args: Vec<String>) -> Result<CliArgs> {
+    let mut log_json_path = None;
+    let mut filtered = Vec::new();
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        if arg == "--log-json" {
+            let next = iter.next();
+            let explicit_path = next
+                .as_deref()
+                .filter(|candidate| !candidate.starts_with('-'))
+                .map(PathBuf::from);
+            if let Some(path) = explicit_path {
+                log_json_path = Some(path);
+            } else {
+                log_json_path = Some(PathBuf::new());
+                if let Some(token) = next {
+                    filtered.push(token);
+                }
+            }
+            continue;
+        }
+
+        filtered.push(arg);
+    }
+
+    let command = filtered.first().cloned();
+    let rest = if filtered.is_empty() {
+        Vec::new()
+    } else {
+        filtered[1..].to_vec()
+    };
+
+    Ok(CliArgs {
+        command,
+        rest,
+        log_json_path,
+    })
+}
+
+fn run_interactive(paths: &AppPaths, log_json_path: Option<PathBuf>) -> Result<()> {
     paths.ensure()?;
 
     let config = AppConfig::load_or_default(&paths.config_path)?;
@@ -58,9 +105,15 @@ fn run_interactive(paths: &AppPaths) -> Result<()> {
             })
             .collect(),
         last_session_recap: database.latest_session_recap()?,
+        study_window: local_context.best_study_window(),
     };
     let snapshot = AppSnapshot::bootstrap(&config, &stats, &startup_context);
-    let (runtime, runtime_error) = match AppServerClient::spawn() {
+    let resolved_log_path = resolve_log_json_path(paths, log_json_path);
+    let runtime_factory = {
+        let log_path = resolved_log_path.clone();
+        Arc::new(move || CodexAppServerTransport::spawn_with_log_path(log_path.clone()))
+    };
+    let (runtime, runtime_error) = match runtime_factory() {
         Ok(runtime) => (Some(runtime), None),
         Err(error) => (None, Some(error.to_string())),
     };
@@ -73,6 +126,7 @@ fn run_interactive(paths: &AppPaths) -> Result<()> {
         local_context,
         snapshot,
         runtime,
+        runtime_factory: Some(runtime_factory),
         runtime_error,
         resume_state,
     });
@@ -98,7 +152,7 @@ fn run_init(paths: &AppPaths) -> Result<()> {
         include_str!("../../../examples/timetable.json"),
     )?;
     write_if_missing(
-        &paths.materials_dir.join("manifest.json"),
+        &paths.materials_manifest_path,
         include_str!("../../../examples/materials-manifest.json"),
     )?;
     write_if_missing(
@@ -123,6 +177,7 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
     let config = AppConfig::load_or_default(&paths.config_path)?;
     let database = AppDatabase::open(&paths.database_path)?;
     let local_context = LocalContext::load(paths)?;
+    let materials_status = load_material_ingestion_status(paths)?;
     let mut stats = database.stats()?;
     stats.upcoming_deadlines = local_context.upcoming_deadline_count();
     let resume = database.load_resume_state()?;
@@ -144,9 +199,10 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
             })
             .collect(),
         last_session_recap: database.latest_session_recap()?,
+        study_window: local_context.best_study_window(),
     };
     let snapshot = AppSnapshot::bootstrap(&config, &stats, &startup_context);
-    let app_server = match AppServerClient::spawn() {
+    let app_server = match CodexAppServerTransport::spawn() {
         Ok(runtime) => {
             let initialized = runtime.initialize().is_ok();
             format!("available (initialize={initialized})")
@@ -156,6 +212,7 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
 
     println!("StudyOS doctor");
     println!("data_dir: {}", paths.root_dir.display());
+    println!("logs_dir: {}", paths.logs_dir.display());
     println!(
         "config_path: {} ({})",
         paths.config_path.display(),
@@ -180,16 +237,84 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
     println!("strictness: {:?}", config.strictness);
     println!("suggested_mode: {}", snapshot.mode.label());
     println!("mode_why_now: {}", snapshot.plan.why_now);
+    println!(
+        "study_window: {}",
+        snapshot
+            .plan
+            .window
+            .as_ref()
+            .map(|window| format!(
+                "{}m {:?} @ {}",
+                window.duration_minutes, window.source, window.start
+            ))
+            .unwrap_or_else(|| "none".to_string())
+    );
     println!("sessions_logged: {}", stats.total_sessions);
     println!("attempts_logged: {}", stats.total_attempts);
     println!("due_reviews: {}", stats.due_reviews);
     println!("loaded_deadlines: {}", local_context.deadlines.len());
     println!("loaded_materials: {}", local_context.materials.len());
     println!("loaded_courses: {}", local_context.courses.courses.len());
+    println!("materials_ingested: {}", materials_status.files_indexed);
+    println!(
+        "materials_last_run: {}",
+        materials_status.last_run_at.as_deref().unwrap_or("never")
+    );
+    println!(
+        "materials_raw_git_safe: {}",
+        if raw_materials_path_looks_safe(paths) {
+            "yes"
+        } else {
+            "warning"
+        }
+    );
     println!("resume_state_present: {}", resume.is_some());
     println!("app_server: {app_server}");
 
     Ok(())
+}
+
+fn run_tour(paths: &AppPaths) -> Result<()> {
+    paths.ensure()?;
+    println!("StudyOS tour");
+    println!("1. Initialize local data once:");
+    println!("   cargo run -p studyos-cli -- init");
+    println!("2. Check local health and runtime wiring:");
+    println!("   cargo run -p studyos-cli -- doctor");
+    println!("3. Drop your course files into:");
+    println!("   {}", paths.materials_raw_dir.display());
+    println!("4. Build the distilled materials index:");
+    println!("   cargo run -p studyos-cli -- materials ingest");
+    println!("5. Add the next exam or coursework deadline:");
+    println!(
+        "   cargo run -p studyos-cli -- deadlines add --title \"Linear models exam\" --due 2026-05-12T09:00:00+01:00 --course \"Matrix Algebra & Linear Models\""
+    );
+    println!("6. Add upcoming timetable slots:");
+    println!(
+        "   cargo run -p studyos-cli -- timetable add --day Mon --start 15:00 --end 17:00 --course \"Matrix Algebra & Linear Models\" --title \"Lecture\""
+    );
+    println!("7. Start a study session:");
+    println!("   cargo run -p studyos-cli");
+    println!("8. During a session use:");
+    println!("   F5 submit answer, q review-and-quit, Ctrl+R reconnect runtime, ? help");
+    println!("9. Optional runtime trace:");
+    println!("   cargo run -p studyos-cli -- --log-json");
+    Ok(())
+}
+
+fn resolve_log_json_path(paths: &AppPaths, requested: Option<PathBuf>) -> Option<PathBuf> {
+    match requested {
+        None => None,
+        Some(path) if path.as_os_str().is_empty() => {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            Some(paths.logs_dir.join(format!("runtime-{timestamp}.jsonl")))
+        }
+        Some(path) if path.is_absolute() => Some(path),
+        Some(path) => Some(paths.root_dir.join(path)),
+    }
 }
 
 fn run_deadlines(paths: &AppPaths, args: &[String]) -> Result<()> {
@@ -202,6 +327,44 @@ fn run_deadlines(paths: &AppPaths, args: &[String]) -> Result<()> {
             "unknown deadlines subcommand: {other}. Use `deadlines list` or `deadlines add`."
         )),
     }
+}
+
+fn run_attempts(paths: &AppPaths, args: &[String]) -> Result<()> {
+    paths.ensure()?;
+
+    match args.first().map(String::as_str) {
+        Some("list") | None => run_attempts_list(paths, &args[1.min(args.len())..]),
+        Some(other) => Err(anyhow!(
+            "unknown attempts subcommand: {other}. Use `attempts list --session <id>`."
+        )),
+    }
+}
+
+fn run_attempts_list(paths: &AppPaths, args: &[String]) -> Result<()> {
+    let session_id = required_option(args, "--session")?;
+    let database = AppDatabase::open(&paths.database_path)?;
+    let attempts = database.list_attempts_for_session(&session_id)?;
+
+    if attempts.is_empty() {
+        println!("No attempts found for session {session_id}");
+        return Ok(());
+    }
+
+    println!("StudyOS attempts for {session_id}");
+    for attempt in attempts {
+        println!(
+            "- {} | concept {} | {} / {} | {} ms",
+            attempt.id,
+            attempt.concept_id,
+            attempt.correctness,
+            attempt.reasoning_quality,
+            attempt.latency_ms
+        );
+        println!("  type: {}", attempt.question_type);
+        println!("  feedback: {}", attempt.feedback_summary);
+    }
+
+    Ok(())
 }
 
 fn run_courses(paths: &AppPaths, args: &[String]) -> Result<()> {
@@ -273,12 +436,25 @@ fn run_materials(paths: &AppPaths, args: &[String]) -> Result<()> {
     paths.ensure()?;
 
     match args.first().map(String::as_str) {
+        Some("ingest") => run_materials_ingest(paths),
         Some("list") | None => run_materials_list(paths, &args[1.min(args.len())..]),
         Some("search") => run_materials_search(paths, &args[1..]),
         Some(other) => Err(anyhow!(
-            "unknown materials subcommand: {other}. Use `materials list` or `materials search`."
+            "unknown materials subcommand: {other}. Use `materials ingest`, `materials list`, or `materials search`."
         )),
     }
+}
+
+fn run_materials_ingest(paths: &AppPaths) -> Result<()> {
+    let courses = CourseCatalog::load(&paths.courses_dir)?;
+    let manifest = ingest_materials(paths, &courses)?;
+    println!(
+        "Ingested {} material files from {} into {}",
+        manifest.entries.len(),
+        paths.materials_raw_dir.display(),
+        paths.materials_manifest_path.display()
+    );
+    Ok(())
 }
 
 fn run_materials_list(paths: &AppPaths, args: &[String]) -> Result<()> {
@@ -293,7 +469,7 @@ fn run_materials_list(paths: &AppPaths, args: &[String]) -> Result<()> {
     if materials.is_empty() {
         println!(
             "No local materials matched in {}.",
-            paths.materials_dir.join("manifest.json").display()
+            paths.materials_manifest_path.display()
         );
         return Ok(());
     }
@@ -478,6 +654,23 @@ fn write_if_missing(path: &std::path::Path, contents: &str) -> Result<()> {
 
 fn exists_flag(path: &std::path::Path) -> &'static str {
     if path.exists() { "present" } else { "missing" }
+}
+
+fn raw_materials_path_looks_safe(paths: &AppPaths) -> bool {
+    if paths
+        .materials_raw_dir
+        .components()
+        .any(|component| component.as_os_str() == ".studyos")
+    {
+        return true;
+    }
+
+    std::process::Command::new("git")
+        .arg("check-ignore")
+        .arg(&paths.materials_raw_dir)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn print_materials(materials: Vec<studyos_core::MaterialEntry>) {

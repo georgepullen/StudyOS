@@ -1,11 +1,13 @@
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use studyos_core::{
     ActivityItem, ActivityStatus, AppConfig, AppDatabase, AppPaths, AppSnapshot, AppStats,
@@ -17,7 +19,7 @@ use studyos_core::{
     WorkingAnswerField, WorkingAnswerState,
 };
 
-use crate::runtime::{AppServerClient, RuntimeEvent};
+use crate::runtime::{AppServerTransport, RuntimeEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusRegion {
@@ -49,6 +51,7 @@ impl FocusRegion {
 
 pub enum AppAction {
     SubmitCurrentAnswer,
+    ReconnectRuntime,
 }
 
 pub struct AppBootstrap {
@@ -58,10 +61,13 @@ pub struct AppBootstrap {
     pub stats: AppStats,
     pub local_context: LocalContext,
     pub snapshot: AppSnapshot,
-    pub runtime: Option<AppServerClient>,
+    pub runtime: Option<Arc<dyn AppServerTransport>>,
+    pub runtime_factory: Option<RuntimeFactory>,
     pub runtime_error: Option<String>,
     pub resume_state: Option<ResumeStateRecord>,
 }
+
+type RuntimeFactory = Arc<dyn Fn() -> Result<Arc<dyn AppServerTransport>> + Send + Sync>;
 
 #[derive(Clone)]
 struct PendingAttemptContext {
@@ -74,9 +80,22 @@ struct PendingAttemptContext {
 }
 
 #[derive(Clone)]
-struct PendingTurn {
+struct TutorPendingTurn {
     display_user_text: Option<String>,
     attempt: Option<PendingAttemptContext>,
+    retry_count: u8,
+}
+
+#[derive(Clone)]
+struct PendingRecapTurn {
+    fallback: SessionRecapSummary,
+    retry_count: u8,
+}
+
+enum QuitState {
+    Idle,
+    Preparing(SessionRecapSummary),
+    Ready(SessionRecapSummary),
 }
 
 pub struct App {
@@ -92,11 +111,14 @@ pub struct App {
     pub transcript_scroll: u16,
     pub widget_states: HashMap<usize, ResponseWidget>,
     pub active_question_index: usize,
-    runtime: Option<AppServerClient>,
+    runtime: Option<Arc<dyn AppServerTransport>>,
+    runtime_factory: Option<RuntimeFactory>,
     runtime_thread_id: Option<String>,
     runtime_ready: bool,
+    runtime_disconnected: bool,
     runtime_bootstrap_applied: bool,
-    pending_structured_turns: HashMap<String, PendingTurn>,
+    pending_structured_turns: HashMap<String, TutorPendingTurn>,
+    pending_recap_turn: Option<(String, PendingRecapTurn)>,
     live_message_indices: HashMap<String, usize>,
     structured_buffers: HashMap<String, String>,
     question_presented_at: HashMap<usize, Instant>,
@@ -104,7 +126,7 @@ pub struct App {
     session_started_at: Instant,
     session_finished: bool,
     session_outcomes: Vec<String>,
-    quit_recap_preview: Option<SessionRecapSummary>,
+    quit_state: QuitState,
 }
 
 impl App {
@@ -117,6 +139,7 @@ impl App {
             local_context,
             snapshot,
             runtime,
+            runtime_factory,
             runtime_error,
             resume_state,
         } = bootstrap;
@@ -155,10 +178,13 @@ impl App {
             widget_states,
             active_question_index,
             runtime,
+            runtime_factory,
             runtime_thread_id: None,
             runtime_ready: false,
+            runtime_disconnected: false,
             runtime_bootstrap_applied: false,
             pending_structured_turns: HashMap::new(),
+            pending_recap_turn: None,
             live_message_indices: HashMap::new(),
             structured_buffers: HashMap::new(),
             question_presented_at,
@@ -166,7 +192,7 @@ impl App {
             session_started_at: Instant::now(),
             session_finished: false,
             session_outcomes: Vec::new(),
-            quit_recap_preview: None,
+            quit_state: QuitState::Idle,
         };
 
         if let Some(resume) = resume_state {
@@ -256,10 +282,15 @@ impl App {
             )?;
             self.pending_structured_turns.insert(
                 turn_id,
-                PendingTurn {
+                TutorPendingTurn {
                     display_user_text: None,
                     attempt: None,
+                    retry_count: 0,
                 },
+            );
+            trim_hash_map(
+                &mut self.pending_structured_turns,
+                MAX_PENDING_RUNTIME_MAP_ENTRIES,
             );
         }
 
@@ -292,27 +323,56 @@ impl App {
             return None;
         }
 
-        if self.quit_recap_preview.is_some() {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Enter => {
+        match (&self.quit_state, key.code) {
+            (QuitState::Preparing(fallback), KeyCode::Char('q'))
+            | (QuitState::Preparing(fallback), KeyCode::Enter) => {
+                let fallback = fallback.clone();
+                if let Err(error) =
+                    self.finalize_session_with_recap(fallback, Some("forced_during_recap"))
+                {
+                    self.push_block(ContentBlock::WarningBox(WarningBox {
+                        title: "Session close failed".to_string(),
+                        body: error.to_string(),
+                    }));
+                } else {
                     self.should_quit = true;
                 }
-                KeyCode::Esc => {
-                    self.quit_recap_preview = None;
-                    self.set_activity(
-                        "Session close",
-                        "Returned to the active study session without closing.".to_string(),
-                        ActivityStatus::Healthy,
-                    );
-                }
-                _ => {}
+                return None;
             }
-            return None;
+            (QuitState::Ready(recap), KeyCode::Char('q'))
+            | (QuitState::Ready(recap), KeyCode::Enter) => {
+                let recap = recap.clone();
+                if let Err(error) = self.finalize_session_with_recap(recap, None) {
+                    self.push_block(ContentBlock::WarningBox(WarningBox {
+                        title: "Session close failed".to_string(),
+                        body: error.to_string(),
+                    }));
+                } else {
+                    self.should_quit = true;
+                }
+                return None;
+            }
+            (QuitState::Preparing(_), KeyCode::Esc) | (QuitState::Ready(_), KeyCode::Esc) => {
+                self.quit_state = QuitState::Idle;
+                self.set_activity(
+                    "Session close",
+                    "Returned to the active study session without closing.".to_string(),
+                    ActivityStatus::Healthy,
+                );
+                return None;
+            }
+            (QuitState::Preparing(_), _) | (QuitState::Ready(_), _) => return None,
+            (QuitState::Idle, _) => {}
         }
 
         match key.code {
             KeyCode::Char('q') => {
-                self.open_quit_recap_review();
+                if let Err(error) = self.request_quit() {
+                    self.push_block(ContentBlock::WarningBox(WarningBox {
+                        title: "Session close failed".to_string(),
+                        body: error.to_string(),
+                    }));
+                }
                 return None;
             }
             KeyCode::Char('?') => {
@@ -326,35 +386,60 @@ impl App {
             KeyCode::F(5) => {
                 return Some(AppAction::SubmitCurrentAnswer);
             }
-            KeyCode::Char('1') => {
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Some(AppAction::ReconnectRuntime);
+            }
+            KeyCode::Char('1')
+                if !matches!(self.focus, FocusRegion::Widget | FocusRegion::Scratchpad) =>
+            {
                 self.snapshot.panel_tab = PanelTab::SessionPlan;
                 return None;
             }
-            KeyCode::Char('2') => {
+            KeyCode::Char('2')
+                if !matches!(self.focus, FocusRegion::Widget | FocusRegion::Scratchpad) =>
+            {
                 self.snapshot.panel_tab = PanelTab::DueReviews;
                 return None;
             }
-            KeyCode::Char('3') => {
+            KeyCode::Char('3')
+                if !matches!(self.focus, FocusRegion::Widget | FocusRegion::Scratchpad) =>
+            {
                 self.snapshot.panel_tab = PanelTab::Deadlines;
                 return None;
             }
-            KeyCode::Char('4') => {
+            KeyCode::Char('4')
+                if !matches!(self.focus, FocusRegion::Widget | FocusRegion::Scratchpad) =>
+            {
                 self.snapshot.panel_tab = PanelTab::Misconceptions;
                 return None;
             }
-            KeyCode::Char('5') => {
+            KeyCode::Char('5')
+                if !matches!(self.focus, FocusRegion::Widget | FocusRegion::Scratchpad) =>
+            {
                 self.snapshot.panel_tab = PanelTab::Scratchpad;
                 return None;
             }
-            KeyCode::Char('6') => {
+            KeyCode::Char('6')
+                if !matches!(self.focus, FocusRegion::Widget | FocusRegion::Scratchpad) =>
+            {
                 self.snapshot.panel_tab = PanelTab::Activity;
                 return None;
             }
-            KeyCode::Char(']') => {
+            KeyCode::Char('7')
+                if !matches!(self.focus, FocusRegion::Widget | FocusRegion::Scratchpad) =>
+            {
+                self.snapshot.panel_tab = PanelTab::RuntimeLog;
+                return None;
+            }
+            KeyCode::Char(']')
+                if !matches!(self.focus, FocusRegion::Widget | FocusRegion::Scratchpad) =>
+            {
                 self.advance_question(1);
                 return None;
             }
-            KeyCode::Char('[') => {
+            KeyCode::Char('[')
+                if !matches!(self.focus, FocusRegion::Widget | FocusRegion::Scratchpad) =>
+            {
                 self.advance_question(-1);
                 return None;
             }
@@ -386,34 +471,7 @@ impl App {
             return Ok(());
         }
 
-        let actual_minutes = (self.session_started_at.elapsed().as_secs() / 60) as i64;
-        let recap = match self.generate_session_recap() {
-            Ok(recap) => recap,
-            Err(error) => {
-                self.set_activity(
-                    "App-server",
-                    format!("Close recap fell back to local summary: {error}"),
-                    ActivityStatus::Idle,
-                );
-                self.fallback_session_recap()
-            }
-        };
-        let outcome_summary = recap.outcome_summary.clone();
-
-        self.database.complete_session(
-            &self.current_session_id,
-            actual_minutes,
-            &outcome_summary,
-            None,
-        )?;
-        self.database.save_session_recap(&SessionRecapRecord {
-            session_id: self.current_session_id.clone(),
-            recap,
-        })?;
-        self.session_finished = true;
-        self.refresh_snapshot_metrics()?;
-        self.persist_resume_state()?;
-        Ok(())
+        self.finalize_session_with_recap(self.fallback_session_recap(), Some("shutdown_fallback"))
     }
 
     pub fn active_widget(&self) -> Option<&ResponseWidget> {
@@ -421,11 +479,18 @@ impl App {
     }
 
     pub fn quit_recap_preview(&self) -> Option<&SessionRecapSummary> {
-        self.quit_recap_preview.as_ref()
+        match &self.quit_state {
+            QuitState::Idle => None,
+            QuitState::Preparing(recap) | QuitState::Ready(recap) => Some(recap),
+        }
+    }
+
+    pub fn quit_recap_is_preparing(&self) -> bool {
+        matches!(self.quit_state, QuitState::Preparing(_))
     }
 
     pub fn current_mode_label(&self) -> &'static str {
-        if self.quit_recap_preview.is_some() {
+        if self.quit_recap_preview().is_some() {
             SessionMode::Recap.label()
         } else {
             self.snapshot.mode.label()
@@ -437,11 +502,7 @@ impl App {
     }
 
     pub fn persist_resume_state(&self) -> Result<()> {
-        let draft_payload = self
-            .active_widget()
-            .map(toml::to_string)
-            .transpose()?
-            .unwrap_or_default();
+        let draft_payload = build_resume_draft_payload(self.active_widget())?;
 
         let record = ResumeStateRecord {
             session_id: "study-session".to_string(),
@@ -482,14 +543,18 @@ impl App {
     }
 
     pub fn status_line(&self) -> String {
-        let runtime_label = if self.runtime_ready {
+        let runtime_label = if self.runtime_disconnected {
+            "App-server disconnected"
+        } else if self.runtime_ready {
             "App-server connected"
         } else if self.runtime.is_some() {
             "App-server starting"
         } else {
             "Local fallback"
         };
-        let quit_label = if self.quit_recap_preview.is_some() {
+        let quit_label = if self.quit_recap_is_preparing() {
+            " | Quit recap preparing"
+        } else if self.quit_recap_preview().is_some() {
             " | Quit review open"
         } else {
             ""
@@ -591,35 +656,19 @@ impl App {
         lines
     }
 
+    pub fn runtime_log_summary(&self) -> Vec<String> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.runtime_log_lines())
+            .filter(|lines| !lines.is_empty())
+            .unwrap_or_else(|| vec!["No runtime log available.".to_string()])
+    }
+
     fn execute_action_inner(&mut self, action: AppAction) -> Result<()> {
         match action {
             AppAction::SubmitCurrentAnswer => self.submit_current_answer(),
+            AppAction::ReconnectRuntime => self.reconnect_runtime(),
         }
-    }
-
-    fn generate_session_recap(&self) -> Result<SessionRecapSummary> {
-        if !self.pending_structured_turns.is_empty() {
-            return Ok(self.fallback_session_recap());
-        }
-
-        let Some(runtime) = &self.runtime else {
-            return Ok(self.fallback_session_recap());
-        };
-        let Some(thread_id) = &self.runtime_thread_id else {
-            return Ok(self.fallback_session_recap());
-        };
-
-        let cwd = self.paths.root_dir.parent().unwrap_or(&self.paths.root_dir);
-        let prompt = self.build_close_prompt();
-        let raw = runtime.run_structured_turn_and_wait(
-            thread_id,
-            &prompt,
-            tutor_close_output_schema(),
-            cwd,
-            Duration::from_secs(45),
-        )?;
-        let payload = serde_json::from_str::<TutorSessionClosePayload>(&raw)?;
-        Ok(payload.recap)
     }
 
     fn fallback_session_recap(&self) -> SessionRecapSummary {
@@ -689,7 +738,117 @@ impl App {
         Ok(())
     }
 
+    fn request_quit(&mut self) -> Result<()> {
+        let fallback = self.fallback_session_recap();
+        if self.pending_recap_turn.is_some() {
+            self.quit_state = QuitState::Preparing(fallback);
+            return Ok(());
+        }
+
+        let Some(runtime) = &self.runtime else {
+            self.quit_state = QuitState::Ready(fallback);
+            return Ok(());
+        };
+        let Some(thread_id) = &self.runtime_thread_id else {
+            self.quit_state = QuitState::Ready(fallback);
+            return Ok(());
+        };
+        if !self.pending_structured_turns.is_empty() {
+            self.quit_state = QuitState::Ready(fallback);
+            self.set_activity(
+                "Session close",
+                "Tutor turn still in flight, so quit review fell back to the local recap."
+                    .to_string(),
+                ActivityStatus::Healthy,
+            );
+            return Ok(());
+        }
+
+        let cwd = self.paths.root_dir.parent().unwrap_or(&self.paths.root_dir);
+        let prompt = self.build_close_prompt();
+        let turn_id =
+            runtime.start_structured_turn(thread_id, &prompt, tutor_close_output_schema(), cwd)?;
+        self.pending_recap_turn = Some((
+            turn_id,
+            PendingRecapTurn {
+                fallback: fallback.clone(),
+                retry_count: 0,
+            },
+        ));
+        self.quit_state = QuitState::Preparing(fallback);
+        self.set_activity(
+            "Session close",
+            "Preparing recap without blocking the session. Press q again to force close."
+                .to_string(),
+            ActivityStatus::Running,
+        );
+        Ok(())
+    }
+
+    fn finalize_session_with_recap(
+        &mut self,
+        recap: SessionRecapSummary,
+        aborted_reason: Option<&str>,
+    ) -> Result<()> {
+        if self.session_finished {
+            return Ok(());
+        }
+
+        let actual_minutes = (self.session_started_at.elapsed().as_secs() / 60) as i64;
+        let outcome_summary = recap.outcome_summary.clone();
+        self.database.complete_session(
+            &self.current_session_id,
+            actual_minutes,
+            &outcome_summary,
+            aborted_reason,
+        )?;
+        self.database.save_session_recap(&SessionRecapRecord {
+            session_id: self.current_session_id.clone(),
+            recap,
+        })?;
+        self.session_finished = true;
+        self.quit_state = QuitState::Idle;
+        self.pending_recap_turn = None;
+        self.refresh_snapshot_metrics()?;
+        self.persist_resume_state()?;
+        Ok(())
+    }
+
+    fn reconnect_runtime(&mut self) -> Result<()> {
+        let Some(factory) = &self.runtime_factory else {
+            return Err(anyhow!(
+                "runtime reconnect is unavailable in this environment"
+            ));
+        };
+
+        self.runtime = Some(factory()?);
+        self.runtime_ready = false;
+        self.runtime_disconnected = false;
+        self.pending_structured_turns.clear();
+        self.pending_recap_turn = None;
+        self.live_message_indices.clear();
+        self.structured_buffers.clear();
+        self.bootstrap_runtime()?;
+        self.set_activity(
+            "App-server",
+            "Respawned Codex app-server and attempted to resume the thread.".to_string(),
+            ActivityStatus::Running,
+        );
+        Ok(())
+    }
+
     fn submit_current_answer(&mut self) -> Result<()> {
+        if self.runtime_disconnected {
+            return Err(anyhow!(
+                "app-server is disconnected; press Ctrl+R to reconnect before submitting"
+            ));
+        }
+        if !self.runtime_ready {
+            return Err(anyhow!(
+                "app-server is still starting; wait for the thread to become ready before submitting"
+            ));
+        }
+
         if let Some(warning) = self.active_widget().and_then(widget_validation_warning) {
             self.push_block(ContentBlock::WarningBox(warning));
             return Ok(());
@@ -706,14 +865,23 @@ impl App {
         let prompt = self.build_submission_prompt();
         let attempt = self.build_pending_attempt_context();
         let cwd = self.paths.root_dir.parent().unwrap_or(&self.paths.root_dir);
-        let turn_id =
-            runtime.start_structured_turn(&thread_id, &prompt, tutor_output_schema(), cwd)?;
+        let turn_id = runtime.start_structured_turn(
+            &thread_id,
+            &prompt,
+            tutor_submission_output_schema(),
+            cwd,
+        )?;
         self.pending_structured_turns.insert(
             turn_id,
-            PendingTurn {
+            TutorPendingTurn {
                 display_user_text: Some(format!("Submitted answer: {}", attempt.question_title)),
                 attempt: Some(attempt),
+                retry_count: 0,
             },
+        );
+        trim_hash_map(
+            &mut self.pending_structured_turns,
+            MAX_PENDING_RUNTIME_MAP_ENTRIES,
         );
         self.set_activity(
             "App-server",
@@ -723,7 +891,7 @@ impl App {
         Ok(())
     }
 
-    fn build_opening_prompt(&self) -> String {
+    pub fn build_opening_prompt(&self) -> String {
         let deadlines = if self.local_context.deadlines.is_empty() {
             "No local deadlines loaded.".to_string()
         } else {
@@ -793,12 +961,25 @@ impl App {
             .map(|slot| format!("{} {}-{} {}", slot.day, slot.start, slot.end, slot.title))
             .collect::<Vec<_>>()
             .join("; ");
+        let study_window = self
+            .snapshot
+            .plan
+            .window
+            .as_ref()
+            .map(|window| {
+                format!(
+                    "{} minutes via {:?} starting {}",
+                    window.duration_minutes, window.source, window.start
+                )
+            })
+            .unwrap_or_else(|| "none".to_string());
 
         format!(
             "You are the StudyOS tutor runtime. Return JSON matching the provided schema only.\n\
             Build a concise opening study step for a real student session.\n\
             Course focus: {course}\n\
             Available session minutes: {minutes}\n\
+            Study window: {study_window}\n\
             Locally routed opening mode: {mode}\n\
             Local route rationale: {why_now}\n\
             Due review count: {due_reviews}\n\
@@ -821,6 +1002,7 @@ impl App {
             self.config.strictness,
             course = self.snapshot.course,
             minutes = self.snapshot.time_remaining_minutes,
+            study_window = study_window,
             mode = self.snapshot.mode.label(),
             why_now = self.snapshot.plan.why_now,
             due_reviews = self.snapshot.metrics.due_reviews,
@@ -869,7 +1051,7 @@ impl App {
             - if the answer is correct, ask one transfer or explanation question next\n\
             - keep the session plan short and updated\n\
             - always include matrix_dimensions; set it to null for non-matrix widgets\n\
-            - include evaluation with correctness, reasoning_quality, feedback_summary, and misconception when warranted\n\
+            - evaluation must be a non-null object with correctness, reasoning_quality, feedback_summary, and misconception when warranted\n\
             - provide exactly one next active question",
             self.snapshot.mode.label(),
             title,
@@ -993,17 +1175,6 @@ impl App {
         }
     }
 
-    fn open_quit_recap_review(&mut self) {
-        let recap = self.fallback_session_recap();
-        self.quit_recap_preview = Some(recap);
-        self.set_activity(
-            "Session close",
-            "Recap preview opened. Press q or Enter to save and quit, or Esc to keep studying."
-                .to_string(),
-            ActivityStatus::Running,
-        );
-    }
-
     fn build_pending_attempt_context(&self) -> PendingAttemptContext {
         let question = self.snapshot.transcript.get(self.active_question_index);
         let (question_title, question_prompt, concept_tags, widget_kind) = match question {
@@ -1087,6 +1258,7 @@ impl App {
         match event {
             RuntimeEvent::ThreadReady { thread_id } => {
                 self.runtime_thread_id = Some(thread_id.clone());
+                self.runtime_disconnected = false;
                 self.set_activity(
                     "App-server",
                     format!("Thread ready: {thread_id}"),
@@ -1113,8 +1285,23 @@ impl App {
                 );
             }
             RuntimeEvent::TurnCompleted { turn_id, status } => {
+                self.rebind_pending_structured_turn_if_needed(&turn_id);
                 if status == "failed" {
                     self.pending_structured_turns.remove(&turn_id);
+                    if self
+                        .pending_recap_turn
+                        .as_ref()
+                        .map(|(pending_turn_id, _)| pending_turn_id == &turn_id)
+                        .unwrap_or(false)
+                    {
+                        let fallback = self
+                            .pending_recap_turn
+                            .as_ref()
+                            .map(|(_, pending)| pending.fallback.clone())
+                            .unwrap_or_else(|| self.fallback_session_recap());
+                        self.quit_state = QuitState::Ready(fallback);
+                        self.pending_recap_turn = None;
+                    }
                 }
                 self.set_activity(
                     "App-server",
@@ -1130,11 +1317,16 @@ impl App {
                 item_id,
                 delta,
             } => {
+                self.rebind_pending_structured_turn_if_needed(&turn_id);
                 if self.pending_structured_turns.contains_key(&turn_id) {
                     self.structured_buffers
                         .entry(item_id)
                         .or_default()
                         .push_str(&delta);
+                    trim_hash_map(
+                        &mut self.structured_buffers,
+                        MAX_PENDING_RUNTIME_MAP_ENTRIES,
+                    );
                 } else if let Some(index) = self.live_message_indices.get(&item_id).copied()
                     && let Some(ContentBlock::Paragraph(paragraph)) =
                         self.snapshot.transcript.get_mut(index)
@@ -1166,18 +1358,32 @@ impl App {
                     body: message,
                 }));
             }
-            RuntimeEvent::Disconnected => {
-                self.set_activity(
-                    "App-server",
-                    "Codex app-server disconnected; the shell has fallen back to local state."
-                        .to_string(),
-                    ActivityStatus::Idle,
-                );
+            RuntimeEvent::Disconnected { message } => {
+                self.runtime_ready = false;
+                self.runtime_disconnected = true;
+                self.pending_structured_turns.clear();
+                if let Some((_, pending)) = self.pending_recap_turn.take() {
+                    self.quit_state = QuitState::Ready(pending.fallback);
+                }
+                self.live_message_indices.clear();
+                self.structured_buffers.clear();
+                self.set_activity("App-server", message, ActivityStatus::Idle);
+                if let Err(error) = self.persist_resume_state() {
+                    self.push_block(ContentBlock::WarningBox(WarningBox {
+                        title: "Resume save failed".to_string(),
+                        body: error.to_string(),
+                    }));
+                }
+                self.push_block(ContentBlock::WarningBox(WarningBox {
+                    title: "Tutor runtime disconnected".to_string(),
+                    body: "StudyOS saved your local resume state. Press Ctrl+R to respawn the runtime and continue.".to_string(),
+                }));
             }
         }
     }
 
     fn handle_runtime_item_started(&mut self, turn_id: &str, item: Value) {
+        self.rebind_pending_structured_turn_if_needed(turn_id);
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
         let item_id = item
             .get("id")
@@ -1185,7 +1391,16 @@ impl App {
             .unwrap_or("")
             .to_string();
 
-        if item_type == "agentMessage" && !self.pending_structured_turns.contains_key(turn_id) {
+        let is_recap_turn = self
+            .pending_recap_turn
+            .as_ref()
+            .map(|(pending_turn_id, _)| pending_turn_id == turn_id)
+            .unwrap_or(false);
+
+        if item_type == "agentMessage"
+            && !self.pending_structured_turns.contains_key(turn_id)
+            && !is_recap_turn
+        {
             let index = self.snapshot.transcript.len();
             self.snapshot
                 .transcript
@@ -1193,19 +1408,34 @@ impl App {
                     text: "Tutor: ".to_string(),
                 }));
             self.live_message_indices.insert(item_id, index);
+            trim_hash_map(
+                &mut self.live_message_indices,
+                MAX_PENDING_RUNTIME_MAP_ENTRIES,
+            );
             return;
         }
 
-        if item_type == "agentMessage" && self.pending_structured_turns.contains_key(turn_id) {
+        if item_type == "agentMessage"
+            && (self.pending_structured_turns.contains_key(turn_id) || is_recap_turn)
+        {
             self.set_activity(
-                "Tutor turn",
-                "Streaming structured tutor payload...".to_string(),
+                if is_recap_turn {
+                    "Session close"
+                } else {
+                    "Tutor turn"
+                },
+                if is_recap_turn {
+                    "Streaming recap payload...".to_string()
+                } else {
+                    "Streaming structured tutor payload...".to_string()
+                },
                 ActivityStatus::Running,
             );
         }
     }
 
     fn handle_runtime_item_completed(&mut self, turn_id: &str, item: Value) {
+        self.rebind_pending_structured_turn_if_needed(turn_id);
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
         match item_type {
             "userMessage" => {
@@ -1240,10 +1470,20 @@ impl App {
                     .unwrap_or("")
                     .to_string();
 
-                if self.pending_structured_turns.contains_key(turn_id) {
+                let is_recap_turn = self
+                    .pending_recap_turn
+                    .as_ref()
+                    .map(|(pending_turn_id, _)| pending_turn_id == turn_id)
+                    .unwrap_or(false);
+
+                if self.pending_structured_turns.contains_key(turn_id) || is_recap_turn {
                     let structured_text = self.structured_buffers.remove(&item_id).unwrap_or(text);
-                    self.apply_structured_tutor_payload(turn_id, &structured_text);
-                    self.pending_structured_turns.remove(turn_id);
+                    if is_recap_turn {
+                        self.apply_structured_close_payload(turn_id, &structured_text);
+                    } else {
+                        self.apply_structured_tutor_payload(turn_id, &structured_text);
+                        self.pending_structured_turns.remove(turn_id);
+                    }
                 } else if let Some(index) = self.live_message_indices.remove(&item_id) {
                     if let Some(ContentBlock::Paragraph(paragraph)) =
                         self.snapshot.transcript.get_mut(index)
@@ -1268,7 +1508,7 @@ impl App {
     }
 
     fn apply_structured_tutor_payload(&mut self, turn_id: &str, raw: &str) {
-        match serde_json::from_str::<TutorTurnPayload>(raw) {
+        match parse_structured_payload::<TutorTurnPayload>(raw) {
             Ok(payload) => {
                 let evaluation_context = self
                     .pending_structured_turns
@@ -1286,7 +1526,10 @@ impl App {
                     }
                 }
 
-                if let Some(plan) = payload.session_plan.clone() {
+                if let Some(mut plan) = payload.session_plan.clone() {
+                    if plan.window.is_none() {
+                        plan.window = self.snapshot.plan.window.clone();
+                    }
                     self.snapshot.plan = plan;
                 }
 
@@ -1313,14 +1556,141 @@ impl App {
                     "Structured tutor payload rendered successfully.".to_string(),
                     ActivityStatus::Healthy,
                 );
+                self.pending_structured_turns.remove(turn_id);
             }
             Err(error) => {
-                self.push_block(ContentBlock::WarningBox(WarningBox {
-                    title: "Structured payload parse failed".to_string(),
-                    body: format!("{error} | Raw response: {raw}"),
-                }));
+                if let Err(retry_error) = self.retry_structured_tutor_turn(turn_id, raw, &error) {
+                    self.push_block(ContentBlock::WarningBox(WarningBox {
+                        title: "Structured payload parse failed".to_string(),
+                        body: format!(
+                            "{error} | Retry failed: {retry_error} | Raw response: {raw}"
+                        ),
+                    }));
+                    self.pending_structured_turns.remove(turn_id);
+                }
             }
         }
+    }
+
+    fn apply_structured_close_payload(&mut self, turn_id: &str, raw: &str) {
+        match parse_structured_payload::<TutorSessionClosePayload>(raw) {
+            Ok(payload) => {
+                self.quit_state = QuitState::Ready(payload.recap);
+                self.pending_recap_turn = None;
+                self.set_activity(
+                    "Session close",
+                    "Recap is ready. Press q or Enter to save and quit.".to_string(),
+                    ActivityStatus::Healthy,
+                );
+            }
+            Err(error) => {
+                if let Err(retry_error) = self.retry_structured_close_turn(turn_id, raw, &error) {
+                    let fallback = self
+                        .pending_recap_turn
+                        .as_ref()
+                        .map(|(_, pending)| pending.fallback.clone())
+                        .unwrap_or_else(|| self.fallback_session_recap());
+                    self.quit_state = QuitState::Ready(fallback);
+                    self.pending_recap_turn = None;
+                    self.push_block(ContentBlock::WarningBox(WarningBox {
+                        title: "Session recap parse failed".to_string(),
+                        body: format!(
+                            "{error} | Retry failed: {retry_error} | Falling back to local recap."
+                        ),
+                    }));
+                }
+            }
+        }
+    }
+
+    fn retry_structured_tutor_turn(
+        &mut self,
+        turn_id: &str,
+        raw: &str,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let Some(mut pending) = self.pending_structured_turns.remove(turn_id) else {
+            return Err(anyhow!("missing pending tutor turn"));
+        };
+        if pending.retry_count >= 1 {
+            return Err(anyhow!("retry budget exhausted"));
+        }
+
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| anyhow!("runtime unavailable for retry"))?;
+        let thread_id = self
+            .runtime_thread_id
+            .clone()
+            .ok_or_else(|| anyhow!("runtime thread unavailable for retry"))?;
+        let cwd = self.paths.root_dir.parent().unwrap_or(&self.paths.root_dir);
+        let retry_prompt = format!(
+            "Your previous answer did not parse as JSON for the client. Re-emit the immediately previous tutor payload as raw JSON only, with no markdown fences or commentary.\nParse error: {error}\nPrevious raw response:\n{raw}"
+        );
+        pending.retry_count += 1;
+        pending.display_user_text = None;
+        let retry_turn_id =
+            runtime.start_structured_turn(&thread_id, &retry_prompt, tutor_output_schema(), cwd)?;
+        self.pending_structured_turns.insert(retry_turn_id, pending);
+        trim_hash_map(
+            &mut self.pending_structured_turns,
+            MAX_PENDING_RUNTIME_MAP_ENTRIES,
+        );
+        self.set_activity(
+            "Runtime diagnostics",
+            "{\"app.runtime.payload_parse_failure\":1,\"kind\":\"tutor\"}".to_string(),
+            ActivityStatus::Idle,
+        );
+        Ok(())
+    }
+
+    fn retry_structured_close_turn(
+        &mut self,
+        turn_id: &str,
+        raw: &str,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let Some((_, mut pending)) = self.pending_recap_turn.take() else {
+            return Err(anyhow!("missing pending recap turn"));
+        };
+        if pending.retry_count >= 1 {
+            return Err(anyhow!("retry budget exhausted"));
+        }
+
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| anyhow!("runtime unavailable for recap retry"))?;
+        let thread_id = self
+            .runtime_thread_id
+            .clone()
+            .ok_or_else(|| anyhow!("runtime thread unavailable for recap retry"))?;
+        let cwd = self.paths.root_dir.parent().unwrap_or(&self.paths.root_dir);
+        let retry_prompt = format!(
+            "Your previous close-session recap did not parse as JSON for the client. Re-emit the immediately previous recap payload as raw JSON only, with no markdown fences or commentary.\nParse error: {error}\nPrevious raw response:\n{raw}"
+        );
+        pending.retry_count += 1;
+        let retry_turn_id = runtime.start_structured_turn(
+            &thread_id,
+            &retry_prompt,
+            tutor_close_output_schema(),
+            cwd,
+        )?;
+        self.pending_recap_turn = Some((retry_turn_id, pending));
+        self.set_activity(
+            "Runtime diagnostics",
+            "{\"app.runtime.payload_parse_failure\":1,\"kind\":\"recap\"}".to_string(),
+            ActivityStatus::Idle,
+        );
+        self.quit_state = QuitState::Preparing(
+            self.pending_recap_turn
+                .as_ref()
+                .map(|(_, pending)| pending.fallback.clone())
+                .unwrap_or_else(|| self.fallback_session_recap()),
+        );
+        let _ = turn_id;
+        Ok(())
     }
 
     fn rebuild_widget_state_from(&mut self, start_index: usize) {
@@ -1329,6 +1699,10 @@ impl App {
                 self.widget_states
                     .insert(index, widget_state_for_question(card));
                 self.question_presented_at.insert(index, Instant::now());
+                trim_hash_map(
+                    &mut self.question_presented_at,
+                    MAX_PENDING_RUNTIME_MAP_ENTRIES,
+                );
                 self.active_question_index = index;
             }
         }
@@ -1336,6 +1710,33 @@ impl App {
 
     fn push_block(&mut self, block: ContentBlock) {
         self.snapshot.transcript.push(block);
+    }
+
+    fn rebind_pending_structured_turn_if_needed(&mut self, observed_turn_id: &str) {
+        if self.pending_structured_turns.contains_key(observed_turn_id)
+            || self.pending_structured_turns.len() != 1
+        {
+            return;
+        }
+
+        let Some(previous_turn_id) = self.pending_structured_turns.keys().next().cloned() else {
+            return;
+        };
+        if previous_turn_id == observed_turn_id {
+            return;
+        }
+
+        if let Some(pending) = self.pending_structured_turns.remove(&previous_turn_id) {
+            self.pending_structured_turns
+                .insert(observed_turn_id.to_string(), pending);
+            self.set_activity(
+                "Tutor turn",
+                format!(
+                    "Rebound pending structured turn {previous_turn_id} to observed runtime turn {observed_turn_id}."
+                ),
+                ActivityStatus::Running,
+            );
+        }
     }
 
     fn set_activity(&mut self, name: &str, detail: String, status: ActivityStatus) {
@@ -1443,7 +1844,7 @@ impl App {
         }
     }
 
-    fn developer_instructions(&self) -> String {
+    pub fn developer_instructions(&self) -> String {
         "You are the StudyOS tutor runtime. Prioritize retrieval before explanation, ask for mathematical reasoning rather than spoon-feeding, and stay concise. When the client provides an output schema, obey it strictly. Prefer one active question at a time and choose widget kinds that match the task precisely.".to_string()
     }
 
@@ -1477,11 +1878,88 @@ impl App {
         }
 
         if !resume.draft_payload.trim().is_empty() {
-            if let Ok(widget) = toml::from_str::<ResponseWidget>(&resume.draft_payload) {
-                self.widget_states
-                    .insert(self.active_question_index, widget);
+            match parse_resume_draft_payload(&resume.draft_payload) {
+                Ok(Some(widget)) => {
+                    self.widget_states
+                        .insert(self.active_question_index, widget);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.push_block(ContentBlock::WarningBox(WarningBox {
+                        title: "Draft restore failed".to_string(),
+                        body: error.to_string(),
+                    }));
+                }
             }
         }
+    }
+}
+
+const RESUME_DRAFT_SCHEMA_VERSION: u32 = 1;
+const MAX_PENDING_RUNTIME_MAP_ENTRIES: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResumeDraftPayload {
+    schema_version: u32,
+    widget: Option<ResponseWidget>,
+}
+
+fn build_resume_draft_payload(widget: Option<&ResponseWidget>) -> Result<String> {
+    Ok(serde_json::to_string(&ResumeDraftPayload {
+        schema_version: RESUME_DRAFT_SCHEMA_VERSION,
+        widget: widget.cloned(),
+    })?)
+}
+
+fn parse_resume_draft_payload(raw: &str) -> Result<Option<ResponseWidget>> {
+    let payload = serde_json::from_str::<ResumeDraftPayload>(raw)?;
+    if payload.schema_version > RESUME_DRAFT_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "resume draft schema {} is newer than this client supports ({RESUME_DRAFT_SCHEMA_VERSION})",
+            payload.schema_version
+        ));
+    }
+
+    Ok(payload.widget)
+}
+
+fn parse_structured_payload<T: DeserializeOwned>(raw: &str) -> Result<T> {
+    let trimmed = strip_json_wrappers(raw);
+    Ok(serde_json::from_str::<T>(&trimmed)?)
+}
+
+fn strip_json_wrappers(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(fenced) = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+    {
+        let unfenced = fenced.trim();
+        return unfenced
+            .strip_suffix("```")
+            .unwrap_or(unfenced)
+            .trim()
+            .to_string();
+    }
+
+    let start = trimmed.find('{').unwrap_or(0);
+    let end = trimmed
+        .rfind('}')
+        .map(|index| index + 1)
+        .unwrap_or(trimmed.len());
+    trimmed[start..end].trim().to_string()
+}
+
+fn trim_hash_map<K, V>(map: &mut HashMap<K, V>, max_len: usize)
+where
+    K: Clone + Eq + Hash,
+{
+    while map.len() > max_len {
+        let Some(key) = map.keys().next().cloned() else {
+            break;
+        };
+        map.remove(&key);
     }
 }
 
@@ -1513,18 +1991,20 @@ fn next_panel_tab(current: PanelTab) -> PanelTab {
         PanelTab::Deadlines => PanelTab::Misconceptions,
         PanelTab::Misconceptions => PanelTab::Scratchpad,
         PanelTab::Scratchpad => PanelTab::Activity,
-        PanelTab::Activity => PanelTab::SessionPlan,
+        PanelTab::Activity => PanelTab::RuntimeLog,
+        PanelTab::RuntimeLog => PanelTab::SessionPlan,
     }
 }
 
 fn previous_panel_tab(current: PanelTab) -> PanelTab {
     match current {
-        PanelTab::SessionPlan => PanelTab::Activity,
+        PanelTab::SessionPlan => PanelTab::RuntimeLog,
         PanelTab::DueReviews => PanelTab::SessionPlan,
         PanelTab::Deadlines => PanelTab::DueReviews,
         PanelTab::Misconceptions => PanelTab::Deadlines,
         PanelTab::Scratchpad => PanelTab::Misconceptions,
         PanelTab::Activity => PanelTab::Scratchpad,
+        PanelTab::RuntimeLog => PanelTab::Activity,
     }
 }
 
@@ -1727,7 +2207,103 @@ fn normalize_identifier(text: &str) -> String {
         .to_string()
 }
 
-fn tutor_output_schema() -> Value {
+pub fn tutor_output_schema() -> Value {
+    tutor_output_schema_with_evaluation(false)
+}
+
+pub fn tutor_submission_output_schema() -> Value {
+    tutor_output_schema_with_evaluation(true)
+}
+
+fn tutor_output_schema_with_evaluation(require_evaluation: bool) -> Value {
+    let evaluation_schema = if require_evaluation {
+        json!({
+            "type": "object",
+            "properties": {
+                "correctness": {
+                    "type": "string",
+                    "enum": ["correct", "partial", "incorrect"]
+                },
+                "reasoning_quality": {
+                    "type": "string",
+                    "enum": ["strong", "adequate", "weak", "missing"]
+                },
+                "feedback_summary": { "type": "string" },
+                "misconception": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "error_type": {
+                            "type": "string",
+                            "enum": [
+                                "conceptual_misunderstanding",
+                                "procedural_slip",
+                                "notation_error",
+                                "arithmetic_error",
+                                "incomplete_justification",
+                                "weak_reasoning"
+                            ]
+                        },
+                        "description": { "type": "string" }
+                    },
+                    "required": ["error_type", "description"],
+                    "additionalProperties": false
+                },
+                "outcome_summary": { "type": ["string", "null"] }
+            },
+            "required": [
+                "correctness",
+                "reasoning_quality",
+                "feedback_summary",
+                "misconception",
+                "outcome_summary"
+            ],
+            "additionalProperties": false
+        })
+    } else {
+        json!({
+            "type": ["object", "null"],
+            "properties": {
+                "correctness": {
+                    "type": "string",
+                    "enum": ["correct", "partial", "incorrect"]
+                },
+                "reasoning_quality": {
+                    "type": "string",
+                    "enum": ["strong", "adequate", "weak", "missing"]
+                },
+                "feedback_summary": { "type": "string" },
+                "misconception": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "error_type": {
+                            "type": "string",
+                            "enum": [
+                                "conceptual_misunderstanding",
+                                "procedural_slip",
+                                "notation_error",
+                                "arithmetic_error",
+                                "incomplete_justification",
+                                "weak_reasoning"
+                            ]
+                        },
+                        "description": { "type": "string" }
+                    },
+                    "required": ["error_type", "description"],
+                    "additionalProperties": false
+                },
+                "outcome_summary": { "type": ["string", "null"] }
+            },
+            "required": [
+                "correctness",
+                "reasoning_quality",
+                "feedback_summary",
+                "misconception",
+                "outcome_summary"
+            ],
+            "additionalProperties": false
+        })
+    };
+
     json!({
         "type": "object",
         "properties": {
@@ -1735,6 +2311,19 @@ fn tutor_output_schema() -> Value {
                 "type": "object",
                 "properties": {
                     "recommended_duration_minutes": { "type": "integer" },
+                    "window": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "start": { "type": "string" },
+                            "duration_minutes": { "type": "integer", "minimum": 1 },
+                            "source": {
+                                "type": "string",
+                                "enum": ["timetable_gap", "before_deadline", "evening_block"]
+                            }
+                        },
+                        "required": ["start", "duration_minutes", "source"],
+                        "additionalProperties": false
+                    },
                     "why_now": { "type": "string" },
                     "warm_up_questions": { "type": "array", "items": { "type": "string" } },
                     "core_targets": { "type": "array", "items": { "type": "string" } },
@@ -1742,6 +2331,7 @@ fn tutor_output_schema() -> Value {
                 },
                 "required": [
                     "recommended_duration_minutes",
+                    "window",
                     "why_now",
                     "warm_up_questions",
                     "core_targets",
@@ -1787,48 +2377,7 @@ fn tutor_output_schema() -> Value {
                 "required": ["title", "prompt", "concept_tags", "widget_kind", "matrix_dimensions"],
                 "additionalProperties": false
             },
-            "evaluation": {
-                "type": ["object", "null"],
-                "properties": {
-                    "correctness": {
-                        "type": "string",
-                        "enum": ["correct", "partial", "incorrect"]
-                    },
-                    "reasoning_quality": {
-                        "type": "string",
-                        "enum": ["strong", "adequate", "weak", "missing"]
-                    },
-                    "feedback_summary": { "type": "string" },
-                    "misconception": {
-                        "type": ["object", "null"],
-                        "properties": {
-                            "error_type": {
-                                "type": "string",
-                                "enum": [
-                                    "conceptual_misunderstanding",
-                                    "procedural_slip",
-                                    "notation_error",
-                                    "arithmetic_error",
-                                    "incomplete_justification",
-                                    "weak_reasoning"
-                                ]
-                            },
-                            "description": { "type": "string" }
-                        },
-                        "required": ["error_type", "description"],
-                        "additionalProperties": false
-                    },
-                    "outcome_summary": { "type": ["string", "null"] }
-                },
-                "required": [
-                    "correctness",
-                    "reasoning_quality",
-                    "feedback_summary",
-                    "misconception",
-                    "outcome_summary"
-                ],
-                "additionalProperties": false
-            }
+            "evaluation": evaluation_schema
         },
         "required": ["session_plan", "teaching_blocks", "question", "evaluation"],
         "additionalProperties": false
@@ -1930,7 +2479,7 @@ fn tutor_recap_block_schema() -> Value {
     })
 }
 
-fn tutor_close_output_schema() -> Value {
+pub fn tutor_close_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -1962,10 +2511,15 @@ fn tutor_close_output_schema() -> Value {
 mod tests {
     use std::{
         env, fs,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::Arc,
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::json;
     use studyos_core::{
         AppConfig, AppDatabase, AppPaths, AppSnapshot, BootstrapStudyContext, ContentBlock,
         LocalContext, MaterialEntry, MatrixDimensions, ResponseWidget, ResponseWidgetKind,
@@ -1974,7 +2528,12 @@ mod tests {
         WorkingAnswerField,
     };
 
-    use super::{App, AppBootstrap, PendingTurn};
+    use crate::{AppServerTransport, RuntimeEvent};
+
+    use super::{
+        App, AppAction, AppBootstrap, TutorPendingTurn, build_resume_draft_payload,
+        parse_resume_draft_payload,
+    };
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1992,6 +2551,100 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap_or_else(|err| panic!("temp dir create failed: {err}"));
         path
+    }
+
+    struct NoopTransport;
+
+    impl AppServerTransport for NoopTransport {
+        fn initialize(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn start_thread(
+            &self,
+            _cwd: &std::path::Path,
+            _developer_instructions: &str,
+        ) -> anyhow::Result<String> {
+            Ok("thread-test".to_string())
+        }
+
+        fn resume_thread(&self, thread_id: &str, _cwd: &std::path::Path) -> anyhow::Result<String> {
+            Ok(thread_id.to_string())
+        }
+
+        fn start_structured_turn(
+            &self,
+            _thread_id: &str,
+            _prompt: &str,
+            _output_schema: serde_json::Value,
+            _cwd: &std::path::Path,
+        ) -> anyhow::Result<String> {
+            Ok("turn-noop".to_string())
+        }
+
+        fn poll_events(&self) -> Vec<RuntimeEvent> {
+            Vec::new()
+        }
+
+        fn runtime_log_lines(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Default)]
+    struct TransportStats {
+        initialize_calls: usize,
+        start_thread_calls: usize,
+        resume_thread_calls: usize,
+    }
+
+    struct CountingTransport {
+        stats: Arc<Mutex<TransportStats>>,
+    }
+
+    impl AppServerTransport for CountingTransport {
+        fn initialize(&self) -> anyhow::Result<()> {
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.initialize_calls += 1;
+            }
+            Ok(())
+        }
+
+        fn start_thread(
+            &self,
+            _cwd: &std::path::Path,
+            _developer_instructions: &str,
+        ) -> anyhow::Result<String> {
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.start_thread_calls += 1;
+            }
+            Ok("thread-counting".to_string())
+        }
+
+        fn resume_thread(&self, thread_id: &str, _cwd: &std::path::Path) -> anyhow::Result<String> {
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.resume_thread_calls += 1;
+            }
+            Ok(thread_id.to_string())
+        }
+
+        fn start_structured_turn(
+            &self,
+            _thread_id: &str,
+            _prompt: &str,
+            _output_schema: serde_json::Value,
+            _cwd: &std::path::Path,
+        ) -> anyhow::Result<String> {
+            Ok("turn-counting".to_string())
+        }
+
+        fn poll_events(&self) -> Vec<RuntimeEvent> {
+            Vec::new()
+        }
+
+        fn runtime_log_lines(&self) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[test]
@@ -2017,6 +2670,7 @@ mod tests {
             local_context: LocalContext::default(),
             snapshot,
             runtime: None,
+            runtime_factory: None,
             runtime_error: None,
             resume_state: None,
         });
@@ -2028,15 +2682,17 @@ mod tests {
         let attempt = app.build_pending_attempt_context();
         app.pending_structured_turns.insert(
             "turn-test".to_string(),
-            PendingTurn {
+            TutorPendingTurn {
                 display_user_text: Some("Submitted answer".to_string()),
                 attempt: Some(attempt),
+                retry_count: 0,
             },
         );
 
         let payload = TutorTurnPayload {
             session_plan: Some(SessionPlanSummary {
                 recommended_duration_minutes: 10,
+                window: None,
                 why_now: "Repair matrix product recall.".to_string(),
                 warm_up_questions: vec!["When is AB defined?".to_string()],
                 core_targets: vec!["Matrix multiplication dimensions".to_string()],
@@ -2111,6 +2767,7 @@ mod tests {
             local_context: LocalContext::default(),
             snapshot,
             runtime: None,
+            runtime_factory: None,
             runtime_error: None,
             resume_state: None,
         });
@@ -2161,6 +2818,7 @@ mod tests {
             local_context: LocalContext::default(),
             snapshot,
             runtime: None,
+            runtime_factory: None,
             runtime_error: None,
             resume_state: None,
         });
@@ -2168,6 +2826,7 @@ mod tests {
         let payload = TutorTurnPayload {
             session_plan: Some(SessionPlanSummary {
                 recommended_duration_minutes: 10,
+                window: None,
                 why_now: "Practice a rectangular matrix product.".to_string(),
                 warm_up_questions: vec!["What is the shape of the output?".to_string()],
                 core_targets: vec!["Matrix multiplication".to_string()],
@@ -2229,6 +2888,7 @@ mod tests {
             local_context: LocalContext::default(),
             snapshot,
             runtime: None,
+            runtime_factory: None,
             runtime_error: None,
             resume_state: None,
         });
@@ -2296,11 +2956,14 @@ mod tests {
                     material_type: "worksheet".to_string(),
                     path: "materials/linear/matrix.pdf".to_string(),
                     snippet: "Compute products and explain undefined cases.".to_string(),
+                    source_hash: String::new(),
+                    source_modified_at: String::new(),
                 }],
                 ..LocalContext::default()
             },
             snapshot,
             runtime: None,
+            runtime_factory: None,
             runtime_error: None,
             resume_state: None,
         });
@@ -2308,6 +2971,347 @@ mod tests {
         let prompt = app.build_opening_prompt();
         assert!(prompt.contains("Relevant local materials"));
         assert!(prompt.contains("Matrix Multiplication Worksheet"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn resume_state_round_trips_per_widget_variant() {
+        let widgets = vec![
+            ResponseWidget::MatrixGrid(studyos_core::MatrixGridState::new(2, 2)),
+            ResponseWidget::WorkingAnswer(studyos_core::WorkingAnswerState {
+                working: "AB".to_string(),
+                final_answer: "C".to_string(),
+                active_field: WorkingAnswerField::FinalAnswer,
+            }),
+            ResponseWidget::StepList(studyos_core::StepListState {
+                steps: vec!["step 1".to_string(), "step 2".to_string()],
+                selected_step: 1,
+            }),
+            ResponseWidget::RetrievalResponse(studyos_core::RetrievalResponseState {
+                response: "variance".to_string(),
+            }),
+        ];
+
+        for widget in widgets {
+            let raw = build_resume_draft_payload(Some(&widget))
+                .unwrap_or_else(|err| panic!("draft payload build failed: {err}"));
+            let parsed = parse_resume_draft_payload(&raw)
+                .unwrap_or_else(|err| panic!("draft payload parse failed: {err}"));
+            assert_eq!(parsed, Some(widget));
+        }
+    }
+
+    #[test]
+    fn widget_draft_survives_restart() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+
+        let mut app = App::new(AppBootstrap {
+            database,
+            paths: paths.clone(),
+            config: config.clone(),
+            stats: stats.clone(),
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: None,
+            runtime_factory: None,
+            runtime_error: None,
+            resume_state: None,
+        });
+        if let Some(ResponseWidget::MatrixGrid(state)) = app.active_widget_mut() {
+            state.cells[0][0] = "5".to_string();
+        }
+        app.persist_resume_state()
+            .unwrap_or_else(|err| panic!("resume persist failed: {err}"));
+
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database reopen failed: {err}"));
+        let resume_state = database
+            .load_resume_state()
+            .unwrap_or_else(|err| panic!("resume load failed: {err}"));
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+        let restarted = App::new(AppBootstrap {
+            database,
+            paths,
+            config,
+            stats,
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: None,
+            runtime_factory: None,
+            runtime_error: None,
+            resume_state,
+        });
+
+        match restarted.active_widget() {
+            Some(ResponseWidget::MatrixGrid(state)) => {
+                assert_eq!(state.cells[0][0], "5");
+            }
+            other => panic!("expected restored matrix widget, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn recap_ready_event_does_not_block_key_handler() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+        let mut app = App::new(AppBootstrap {
+            database,
+            paths,
+            config,
+            stats,
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: Some(Arc::new(NoopTransport)),
+            runtime_factory: Some(Arc::new(|| Ok(Arc::new(NoopTransport)))),
+            runtime_error: None,
+            resume_state: None,
+        });
+        app.runtime_thread_id = Some("thread-test".to_string());
+
+        let started = std::time::Instant::now();
+        app.handle_key(KeyEvent::from(KeyCode::Char('q')));
+        assert!(
+            started.elapsed().as_millis() < 50,
+            "quit key handler should not block on recap generation"
+        );
+        assert!(app.quit_recap_is_preparing());
+    }
+
+    #[test]
+    fn disconnect_persists_resume_and_blocks_submission() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+        let mut app = App::new(AppBootstrap {
+            database,
+            paths: paths.clone(),
+            config: config.clone(),
+            stats,
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: Some(Arc::new(NoopTransport)),
+            runtime_factory: Some(Arc::new(|| Ok(Arc::new(NoopTransport)))),
+            runtime_error: None,
+            resume_state: None,
+        });
+        app.runtime_ready = true;
+        app.runtime_thread_id = Some("thread-test".to_string());
+        if let Some(ResponseWidget::MatrixGrid(state)) = app.active_widget_mut() {
+            state.cells[0][0] = "9".to_string();
+        }
+
+        app.handle_runtime_event(RuntimeEvent::Disconnected {
+            message: "simulated disconnect".to_string(),
+        });
+
+        let resume = app
+            .database
+            .load_resume_state()
+            .unwrap_or_else(|err| panic!("resume state load failed: {err}"))
+            .unwrap_or_else(|| panic!("resume state should be persisted on disconnect"));
+        assert!(resume.draft_payload.contains("\"schema_version\":1"));
+
+        app.execute_action(AppAction::SubmitCurrentAnswer);
+        let warning = app
+            .snapshot
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|block| match block {
+                ContentBlock::WarningBox(warning) => Some(warning),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("disconnect warning should be visible"));
+        assert!(warning.body.contains("Ctrl+R"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn ctrl_r_reconnects_runtime_after_disconnect() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+        let transport_stats = Arc::new(Mutex::new(TransportStats::default()));
+        let factory_stats = Arc::clone(&transport_stats);
+        let runtime_factory = Arc::new(move || {
+            Ok(Arc::new(CountingTransport {
+                stats: Arc::clone(&factory_stats),
+            }) as Arc<dyn AppServerTransport>)
+        });
+        let runtime =
+            runtime_factory().unwrap_or_else(|err| panic!("runtime factory should succeed: {err}"));
+
+        let mut app = App::new(AppBootstrap {
+            database,
+            paths: paths.clone(),
+            config,
+            stats,
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: Some(runtime),
+            runtime_factory: Some(runtime_factory),
+            runtime_error: None,
+            resume_state: None,
+        });
+        app.runtime_thread_id = Some("thread-test".to_string());
+        app.handle_runtime_event(RuntimeEvent::Disconnected {
+            message: "simulated disconnect".to_string(),
+        });
+
+        let action = app
+            .handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .unwrap_or_else(|| panic!("Ctrl+R should return reconnect action"));
+        app.execute_action(action);
+
+        let stats = transport_stats
+            .lock()
+            .unwrap_or_else(|_| panic!("transport stats lock should not be poisoned"));
+        assert_eq!(stats.initialize_calls, 1);
+        assert_eq!(stats.resume_thread_calls, 1);
+        assert_eq!(stats.start_thread_calls, 0);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn mismatched_runtime_turn_id_still_persists_structured_payload() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+        let mut app = App::new(AppBootstrap {
+            database,
+            paths: paths.clone(),
+            config,
+            stats,
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: None,
+            runtime_factory: None,
+            runtime_error: None,
+            resume_state: None,
+        });
+        if let Some(ResponseWidget::MatrixGrid(state)) = app.active_widget_mut() {
+            state.cells[0][0] = "2".to_string();
+        }
+
+        let attempt = app.build_pending_attempt_context();
+        app.pending_structured_turns.insert(
+            "turn-requested".to_string(),
+            TutorPendingTurn {
+                display_user_text: Some("Submitted answer".to_string()),
+                attempt: Some(attempt),
+                retry_count: 0,
+            },
+        );
+
+        let payload = TutorTurnPayload {
+            session_plan: Some(SessionPlanSummary {
+                recommended_duration_minutes: 10,
+                window: None,
+                why_now: "Repair the row-by-column method.".to_string(),
+                warm_up_questions: vec!["Which row and column define one entry?".to_string()],
+                core_targets: vec!["Matrix multiplication".to_string()],
+                stretch_target: None,
+            }),
+            teaching_blocks: vec![TutorBlock::Paragraph {
+                text: "Use one row and one column per entry.".to_string(),
+            }],
+            question: Some(TutorQuestion {
+                title: "Repair".to_string(),
+                prompt: "Compute the first entry only.".to_string(),
+                concept_tags: vec!["matrix_multiplication".to_string()],
+                widget_kind: ResponseWidgetKind::WorkingAnswer,
+                matrix_dimensions: None,
+            }),
+            evaluation: Some(TutorEvaluation {
+                correctness: TutorCorrectness::Incorrect,
+                reasoning_quality: TutorReasoningQuality::Weak,
+                feedback_summary: "The method needs repair.".to_string(),
+                misconception: Some(TutorMisconception {
+                    error_type: TutorErrorType::ConceptualMisunderstanding,
+                    description: "Mixed up entrywise and row-by-column multiplication.".to_string(),
+                }),
+                outcome_summary: Some("Repair the multiplication rule.".to_string()),
+            }),
+        };
+
+        let payload_raw = serde_json::to_string(&payload)
+            .unwrap_or_else(|err| panic!("payload serialization failed: {err}"));
+        app.handle_runtime_event(RuntimeEvent::AgentMessageDelta {
+            turn_id: "turn-observed".to_string(),
+            item_id: "item-1".to_string(),
+            delta: payload_raw.clone(),
+        });
+        app.handle_runtime_event(RuntimeEvent::ItemCompleted {
+            turn_id: "turn-observed".to_string(),
+            item: json!({
+                "type": "agentMessage",
+                "id": "item-1",
+                "text": payload_raw,
+            }),
+        });
+
+        let stats = app
+            .database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        assert_eq!(stats.total_attempts, 1);
+        assert!(app.pending_structured_turns.is_empty());
 
         let _ = fs::remove_dir_all(base);
     }

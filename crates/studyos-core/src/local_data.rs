@@ -1,10 +1,16 @@
-use std::{fs, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{Duration, OffsetDateTime, Weekday, format_description::well_known::Rfc3339};
 
-use crate::{AppPaths, CourseCatalog};
+use crate::{AppPaths, CourseCatalog, StudyWindow, WindowSource};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeadlineEntry {
@@ -40,6 +46,29 @@ pub struct MaterialEntry {
     pub material_type: String,
     pub path: String,
     pub snippet: String,
+    #[serde(default)]
+    pub source_hash: String,
+    #[serde(default)]
+    pub source_modified_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MaterialConceptIndexEntry {
+    pub path: String,
+    pub topic_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MaterialManifest {
+    pub generated_at: String,
+    #[serde(default)]
+    pub entries: Vec<MaterialEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MaterialIngestionStatus {
+    pub files_indexed: usize,
+    pub last_run_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -54,8 +83,7 @@ impl LocalContext {
     pub fn load(paths: &AppPaths) -> Result<Self> {
         let deadlines = load_deadlines(&paths.deadlines_path)?;
         let timetable = load_timetable(&paths.timetable_path)?;
-        let materials_manifest = paths.materials_dir.join("manifest.json");
-        let materials = load_materials(&materials_manifest)?;
+        let materials = load_materials(&paths.materials_manifest_path)?;
         let courses = CourseCatalog::load(&paths.courses_dir)?;
 
         Ok(Self {
@@ -172,6 +200,68 @@ impl LocalContext {
         let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
         timetable.slots_for_weekday(now.weekday())
     }
+
+    pub fn best_study_window(&self) -> Option<StudyWindow> {
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        self.best_study_window_at(now)
+    }
+
+    pub fn best_study_window_at(&self, now: OffsetDateTime) -> Option<StudyWindow> {
+        if let Some(window) = self.timetable_gap_window(now) {
+            return Some(window);
+        }
+
+        let local_hour = now.hour();
+        let duration_minutes = if local_hour >= 20 { 60 } else { 90 };
+        let source = if self.has_deadline_within_hours(now, 48) {
+            WindowSource::BeforeDeadline
+        } else {
+            WindowSource::EveningBlock
+        };
+        Some(StudyWindow {
+            start: now.format(&Rfc3339).unwrap_or_else(|_| now.to_string()),
+            duration_minutes,
+            source,
+        })
+    }
+
+    fn timetable_gap_window(&self, now: OffsetDateTime) -> Option<StudyWindow> {
+        let timetable = self.timetable.as_ref()?;
+        for slot in timetable.slots_for_weekday(now.weekday()) {
+            let start_minutes = parse_clock_minutes(&slot.start)?;
+            let now_minutes = (now.hour() as u16) * 60 + now.minute() as u16;
+            if start_minutes <= now_minutes {
+                continue;
+            }
+
+            let gap_minutes = start_minutes.saturating_sub(now_minutes);
+            if gap_minutes < 10 {
+                continue;
+            }
+
+            let source = if self.has_deadline_within_hours(now, 48) {
+                WindowSource::BeforeDeadline
+            } else {
+                WindowSource::TimetableGap
+            };
+            return Some(StudyWindow {
+                start: now.format(&Rfc3339).unwrap_or_else(|_| now.to_string()),
+                duration_minutes: gap_minutes.min(120),
+                source,
+            });
+        }
+
+        None
+    }
+
+    fn has_deadline_within_hours(&self, now: OffsetDateTime, hours: i64) -> bool {
+        let horizon = now + Duration::hours(hours);
+        self.deadlines.iter().any(|deadline| {
+            OffsetDateTime::parse(&deadline.due_at, &Rfc3339)
+                .map(|due_at| due_at >= now && due_at <= horizon)
+                .unwrap_or(false)
+        })
+    }
 }
 
 impl TimetableData {
@@ -224,9 +314,129 @@ pub fn upsert_deadline(path: &Path, entry: DeadlineEntry) -> Result<Vec<Deadline
 }
 
 pub fn load_materials(path: &Path) -> Result<Vec<MaterialEntry>> {
-    let mut materials = load_json_file::<Vec<MaterialEntry>>(path)?.unwrap_or_default();
+    let mut materials = if !path.exists() {
+        Vec::new()
+    } else {
+        let raw = fs::read_to_string(path)?;
+        if let Ok(manifest) = serde_json::from_str::<MaterialManifest>(&raw) {
+            manifest.entries
+        } else {
+            serde_json::from_str::<Vec<MaterialEntry>>(&raw)?
+        }
+    };
     materials.sort_by(|left, right| left.title.cmp(&right.title));
     Ok(materials)
+}
+
+pub fn load_material_ingestion_status(paths: &AppPaths) -> Result<MaterialIngestionStatus> {
+    if !paths.materials_manifest_path.exists() {
+        return Ok(MaterialIngestionStatus::default());
+    }
+
+    let raw = fs::read_to_string(&paths.materials_manifest_path)?;
+    let manifest = serde_json::from_str::<MaterialManifest>(&raw)?;
+    Ok(MaterialIngestionStatus {
+        files_indexed: manifest.entries.len(),
+        last_run_at: (!manifest.generated_at.trim().is_empty()).then_some(manifest.generated_at),
+    })
+}
+
+pub fn ingest_materials(paths: &AppPaths, courses: &CourseCatalog) -> Result<MaterialManifest> {
+    fs::create_dir_all(&paths.materials_raw_dir)?;
+    fs::create_dir_all(&paths.materials_index_dir)?;
+
+    let previous_manifest = if paths.materials_manifest_path.exists() {
+        let raw = fs::read_to_string(&paths.materials_manifest_path)?;
+        serde_json::from_str::<MaterialManifest>(&raw).unwrap_or_default()
+    } else {
+        MaterialManifest::default()
+    };
+
+    let mut previous_by_path = previous_manifest
+        .entries
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut entries = Vec::new();
+    let mut concepts = Vec::new();
+
+    for path in walk_material_files(&paths.materials_raw_dir)? {
+        let relative_path = path
+            .strip_prefix(&paths.materials_raw_dir)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let metadata = fs::metadata(&path)?;
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_rfc3339)
+            .unwrap_or_default();
+        let source_hash = hash_file(&path)?;
+
+        if let Some(previous) = previous_by_path.remove(&relative_path)
+            && previous.source_hash == source_hash
+            && previous.source_modified_at == modified_at
+        {
+            concepts.push(MaterialConceptIndexEntry {
+                path: previous.path.clone(),
+                topic_tags: previous.topic_tags.clone(),
+            });
+            entries.push(previous);
+            continue;
+        }
+
+        let extracted_text = match extract_material_text(&path) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let snippet = snippet_from_text(&extracted_text);
+        let title = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| relative_path.clone());
+        let topic_tags = derive_topic_tags(&title, &extracted_text, courses);
+        let course = infer_course(&title, &extracted_text, courses, &topic_tags);
+        let material_type = infer_material_type(&path);
+
+        let entry = MaterialEntry {
+            id: make_material_id(&relative_path),
+            title,
+            course,
+            topic_tags: topic_tags.clone(),
+            material_type,
+            path: relative_path.clone(),
+            snippet,
+            source_hash,
+            source_modified_at: modified_at,
+        };
+        concepts.push(MaterialConceptIndexEntry {
+            path: relative_path,
+            topic_tags,
+        });
+        entries.push(entry);
+    }
+
+    entries.sort_by(|left, right| left.title.cmp(&right.title));
+    concepts.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let manifest = MaterialManifest {
+        generated_at: OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string()),
+        entries,
+    };
+    fs::write(
+        &paths.materials_manifest_path,
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    fs::write(
+        &paths.materials_concepts_path,
+        serde_json::to_string_pretty(&concepts)?,
+    )?;
+    Ok(manifest)
 }
 
 pub fn load_timetable(path: &Path) -> Result<Option<TimetableData>> {
@@ -278,6 +488,13 @@ fn parse_weekday(day: &str) -> Option<Weekday> {
     }
 }
 
+fn parse_clock_minutes(clock: &str) -> Option<u16> {
+    let mut parts = clock.split(':');
+    let hour = parts.next()?.parse::<u16>().ok()?;
+    let minute = parts.next()?.parse::<u16>().ok()?;
+    Some(hour * 60 + minute)
+}
+
 fn weekday_index(day: Weekday) -> u8 {
     match day {
         Weekday::Monday => 0,
@@ -305,6 +522,143 @@ fn sort_timetable_slots(slots: &mut [TimetableSlot]) {
     });
 }
 
+fn walk_material_files(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut stack = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(path) = stack.pop() {
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                stack.push(entry_path);
+            } else {
+                files.push(entry_path);
+            }
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+fn extract_material_text(path: &Path) -> Result<String> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "md" | "txt" | "tex" => Ok(fs::read_to_string(path)?),
+        "pdf" => pdf_extract::extract_text(path)
+            .map_err(|error| anyhow!("pdf extraction failed for {}: {error}", path.display())),
+        "docx" | "pptx" | "odt" => Err(anyhow!(
+            "unsupported material type for {} (document Office formats are deferred)",
+            path.display()
+        )),
+        other => Err(anyhow!(
+            "unsupported material type for {} (.{other})",
+            path.display()
+        )),
+    }
+}
+
+fn snippet_from_text(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(500).collect::<String>()
+}
+
+fn derive_topic_tags(title: &str, text: &str, courses: &CourseCatalog) -> Vec<String> {
+    let haystack = format!("{title} {text}").to_lowercase();
+    let mut tags = HashSet::new();
+
+    for course in &courses.courses {
+        for concept in &course.concepts {
+            let title_match = haystack.contains(&concept.title.to_lowercase());
+            let tag_match = concept
+                .tags
+                .iter()
+                .any(|tag| haystack.contains(&normalize_lookup_token(tag)));
+            if title_match || tag_match {
+                tags.insert(concept.id.clone());
+                for tag in &concept.tags {
+                    tags.insert(tag.clone());
+                }
+            }
+        }
+    }
+
+    let mut tags = tags.into_iter().collect::<Vec<_>>();
+    tags.sort();
+    tags.truncate(6);
+    tags
+}
+
+fn infer_course(title: &str, text: &str, courses: &CourseCatalog, topic_tags: &[String]) -> String {
+    let haystack = format!("{title} {text} {}", topic_tags.join(" ")).to_lowercase();
+    let mut best_course = None::<(&str, usize)>;
+
+    for course in &courses.courses {
+        let mut score = 0usize;
+        if haystack.contains(&course.title.to_lowercase()) {
+            score += 3;
+        }
+        for concept in &course.concepts {
+            if haystack.contains(&concept.title.to_lowercase()) {
+                score += 2;
+            }
+            for tag in &concept.tags {
+                if haystack.contains(&normalize_lookup_token(tag)) {
+                    score += 1;
+                }
+            }
+        }
+        if score > best_course.map(|(_, best)| best).unwrap_or(0) {
+            best_course = Some((course.title.as_str(), score));
+        }
+    }
+
+    best_course
+        .filter(|(_, score)| *score > 0)
+        .map(|(title, _)| title.to_string())
+        .unwrap_or_else(|| "Uncategorized".to_string())
+}
+
+fn infer_material_type(path: &Path) -> String {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("unknown")
+        .to_ascii_lowercase()
+}
+
+fn normalize_lookup_token(token: &str) -> String {
+    token.to_lowercase().replace(['_', '-'], " ")
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(format!("{:x}", hasher.finish()))
+}
+
+fn system_time_to_rfc3339(system_time: SystemTime) -> Option<String> {
+    let duration = system_time.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    OffsetDateTime::from_unix_timestamp(duration.as_secs() as i64)
+        .ok()
+        .and_then(|time| time.format(&Rfc3339).ok())
+}
+
+fn make_material_id(seed: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    format!("material-{:x}", hasher.finish())
+}
+
 fn load_json_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
@@ -316,9 +670,14 @@ fn load_json_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        env,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     use super::*;
+    use crate::{AppPaths, ConceptDefinition, CourseDefinition, TopicDefinition};
 
     static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -332,6 +691,58 @@ mod tests {
         ));
         let _ = fs::remove_file(&path);
         path
+    }
+
+    fn temp_data_root(label: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "studyos-materials-{label}-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap_or_else(|err| panic!("temp dir create failed: {err}"));
+        path
+    }
+
+    fn sample_catalog() -> CourseCatalog {
+        CourseCatalog {
+            courses: vec![
+                CourseDefinition {
+                    course_id: "linear".to_string(),
+                    title: "Matrix Algebra & Linear Models".to_string(),
+                    topics: vec![TopicDefinition {
+                        id: "matrix-basics".to_string(),
+                        title: "Matrix Basics".to_string(),
+                        summary: "Matrices and linear models.".to_string(),
+                    }],
+                    concepts: vec![ConceptDefinition {
+                        id: "matrix_multiplication".to_string(),
+                        topic_id: "matrix-basics".to_string(),
+                        title: "Matrix multiplication".to_string(),
+                        summary: "Row by column products.".to_string(),
+                        prerequisite_ids: vec![],
+                        tags: vec!["matrix_multiplication".to_string(), "ols".to_string()],
+                    }],
+                },
+                CourseDefinition {
+                    course_id: "probability".to_string(),
+                    title: "Probability & Statistics for Scientists".to_string(),
+                    topics: vec![TopicDefinition {
+                        id: "variance".to_string(),
+                        title: "Variance".to_string(),
+                        summary: "Spread and expectation.".to_string(),
+                    }],
+                    concepts: vec![ConceptDefinition {
+                        id: "variance_definition".to_string(),
+                        topic_id: "variance".to_string(),
+                        title: "Variance".to_string(),
+                        summary: "Expected squared deviation.".to_string(),
+                        prerequisite_ids: vec![],
+                        tags: vec!["variance".to_string(), "expectation".to_string()],
+                    }],
+                },
+            ],
+        }
     }
 
     #[test]
@@ -419,6 +830,8 @@ mod tests {
                     material_type: "worksheet".to_string(),
                     path: "materials/linear/matrix.pdf".to_string(),
                     snippet: "Compute products and explain undefined cases.".to_string(),
+                    source_hash: String::new(),
+                    source_modified_at: String::new(),
                 },
                 MaterialEntry {
                     id: "variance-notes".to_string(),
@@ -428,6 +841,8 @@ mod tests {
                     material_type: "notes".to_string(),
                     path: "materials/probability/variance.md".to_string(),
                     snippet: "Variance as expected squared deviation.".to_string(),
+                    source_hash: String::new(),
+                    source_modified_at: String::new(),
                 },
             ],
             courses: CourseCatalog::default(),
@@ -513,5 +928,88 @@ mod tests {
         assert_eq!(loaded.slots[1].day, "wednesday");
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn materials_ingest_walks_raw_dir_and_writes_manifest() {
+        let root = temp_data_root("ingest-manifest");
+        let paths = AppPaths::discover(&root);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        fs::write(
+            paths.materials_raw_dir.join("matrix-notes.md"),
+            "# Matrix Multiplication\nOLS relies on matrix multiplication and linear models.\n",
+        )
+        .unwrap_or_else(|err| panic!("failed to write raw notes: {err}"));
+        fs::write(paths.materials_raw_dir.join("skip.docx"), b"binary")
+            .unwrap_or_else(|err| panic!("failed to write unsupported file: {err}"));
+
+        let manifest = ingest_materials(&paths, &sample_catalog())
+            .unwrap_or_else(|err| panic!("materials ingest failed: {err}"));
+
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].course, "Matrix Algebra & Linear Models");
+        assert!(
+            manifest.entries[0]
+                .topic_tags
+                .iter()
+                .any(|tag| tag == "matrix_multiplication")
+        );
+        assert!(paths.materials_manifest_path.exists());
+        assert!(paths.materials_concepts_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn materials_ingest_is_incremental_for_unchanged_files() {
+        let root = temp_data_root("ingest-incremental");
+        let paths = AppPaths::discover(&root);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        fs::write(
+            paths.materials_raw_dir.join("variance.txt"),
+            "Variance is the expected squared deviation from the mean.",
+        )
+        .unwrap_or_else(|err| panic!("failed to write raw text: {err}"));
+
+        let first = ingest_materials(&paths, &sample_catalog())
+            .unwrap_or_else(|err| panic!("first ingest failed: {err}"));
+        let second = ingest_materials(&paths, &sample_catalog())
+            .unwrap_or_else(|err| panic!("second ingest failed: {err}"));
+
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0], second.entries[0]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ingest_extracts_non_empty_snippet_from_pdf_fixture() {
+        let root = temp_data_root("ingest-pdf");
+        let paths = AppPaths::discover(&root);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/materials/raw/linear-models.pdf");
+        fs::copy(&fixture, paths.materials_raw_dir.join("linear-models.pdf"))
+            .unwrap_or_else(|err| panic!("failed to copy pdf fixture: {err}"));
+
+        let manifest = ingest_materials(&paths, &sample_catalog())
+            .unwrap_or_else(|err| panic!("pdf ingest failed: {err}"));
+
+        assert_eq!(manifest.entries.len(), 1);
+        assert!(!manifest.entries[0].snippet.trim().is_empty());
+        assert!(
+            manifest.entries[0]
+                .snippet
+                .to_lowercase()
+                .contains("linear")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

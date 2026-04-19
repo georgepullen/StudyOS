@@ -249,6 +249,7 @@ fn render_panel(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .collect(),
         ),
         PanelTab::Activity => activity_lines(app),
+        PanelTab::RuntimeLog => simple_lines(app.runtime_log_summary()),
     };
 
     let panel = Paragraph::new(lines)
@@ -518,9 +519,10 @@ fn render_help_overlay(frame: &mut Frame<'_>, app: &App) {
         Line::from("q        open recap review / confirm quit"),
         Line::from("tab      cycle focus"),
         Line::from("?        toggle this help"),
-        Line::from("1..6     switch side panel tabs"),
+        Line::from("1..7     switch side panel tabs"),
         Line::from("[ / ]    move between question cards"),
         Line::from("F5       submit active structured answer"),
+        Line::from("Ctrl+R   reconnect app-server after disconnect"),
         Line::from(""),
         Line::from(format!("Current focus: {}", app.focus.label())),
         Line::from("Transcript focus: arrows scroll"),
@@ -550,7 +552,11 @@ fn render_quit_overlay(
 
     let mut lines = vec![
         Line::from(Span::styled(
-            "Session recap before exit",
+            if app.quit_recap_is_preparing() {
+                "Preparing session recap"
+            } else {
+                "Session recap before exit"
+            },
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -614,13 +620,28 @@ fn render_quit_overlay(
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(format!(
-        "Press q or Enter to save and quit {}. Press Esc to keep studying.",
-        app.snapshot.course
-    )));
+    lines.push(Line::from(if app.quit_recap_is_preparing() {
+        format!(
+            "Recap is still generating. Press q or Enter to force-save the fallback recap for {}. Press Esc to keep studying.",
+            app.snapshot.course
+        )
+    } else {
+        format!(
+            "Press q or Enter to save and quit {}. Press Esc to keep studying.",
+            app.snapshot.course
+        )
+    }));
 
     let overlay = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("Exit Review"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(if app.quit_recap_is_preparing() {
+                    "Exit Review (Preparing)"
+                } else {
+                    "Exit Review"
+                }),
+        )
         .wrap(Wrap { trim: false });
 
     frame.render_widget(overlay, area);

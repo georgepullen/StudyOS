@@ -14,17 +14,18 @@ pub use content::{
 };
 pub use course::{ConceptDefinition, CourseCatalog, CourseDefinition, TopicDefinition};
 pub use local_data::{
-    DeadlineEntry, LocalContext, MaterialEntry, TimetableData, TimetableSlot,
-    append_timetable_slot, load_deadlines, load_materials, load_timetable, save_deadlines,
+    DeadlineEntry, LocalContext, MaterialConceptIndexEntry, MaterialEntry, MaterialIngestionStatus,
+    MaterialManifest, TimetableData, TimetableSlot, append_timetable_slot, ingest_materials,
+    load_deadlines, load_material_ingestion_status, load_materials, load_timetable, save_deadlines,
     save_timetable, upsert_deadline,
 };
 pub use session::{
     ActivityItem, ActivityStatus, AppSnapshot, BootstrapStudyContext, DeadlineUrgency,
     KeybindingHint, PanelTab, SessionMetrics, SessionMode, SessionPlanSummary, SessionRecapSummary,
-    StartupMisconceptionItem, StartupReviewItem,
+    StartupMisconceptionItem, StartupReviewItem, StudyWindow, WindowSource,
 };
 pub use store::{
-    AppDatabase, AppStats, AttemptRecord, DueReviewSummary, MisconceptionInput,
+    AppDatabase, AppStats, AttemptAuditRecord, AttemptRecord, DueReviewSummary, MisconceptionInput,
     MisconceptionSummary, ResumeStateRecord, SessionRecapRecord, SessionRecord,
 };
 pub use tutor::{

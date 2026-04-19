@@ -110,6 +110,14 @@ Sanity check the workspace:
 
 ```bash
 just check
+# or, if `just` is not installed:
+./scripts/check.sh
+```
+
+Onboard yourself with the built-in tour:
+
+```bash
+cargo run -p studyos-cli -- tour
 ```
 
 Run:
@@ -122,9 +130,10 @@ Useful keys:
 
 - `q` open recap review, then confirm safe exit
 - `tab` cycle focus regions
-- `1` to `6` switch side panels
+- `1` to `7` switch side panels
 - `[` and `]` jump between active questions
 - `F5` submit the active structured answer
+- `Ctrl+R` reconnect the app-server after a disconnect
 - `?` show help
 
 Initialize local starter files:
@@ -137,6 +146,12 @@ Inspect local setup health:
 
 ```bash
 cargo run -p studyos-cli -- doctor
+```
+
+Write runtime JSONL traces under `.studyos/logs/` for debugging:
+
+```bash
+cargo run -p studyos-cli -- --log-json
 ```
 
 Manage local deadlines without hand-editing JSON:
@@ -158,11 +173,18 @@ cargo run -p studyos-cli -- courses list
 cargo run -p studyos-cli -- courses use --title "Probability & Statistics for Scientists"
 ```
 
-Search local materials metadata:
+Ingest local course materials and search the distilled index:
 
 ```bash
+cargo run -p studyos-cli -- materials ingest
 cargo run -p studyos-cli -- materials list
 cargo run -p studyos-cli -- materials search --query "variance"
+```
+
+Inspect the attempt audit trail for a session:
+
+```bash
+cargo run -p studyos-cli -- attempts list --session <session-id>
 ```
 
 Inspect the local timetable:
@@ -189,12 +211,20 @@ These should be copied into the local `.studyos/` data directory when you want t
   config.toml
   deadlines.json
   timetable.json
+  logs/
+    runtime-<timestamp>.jsonl
   courses/
     linear-models.toml
     probability-stats.toml
   materials/
+    raw/
+      <drop your PDFs, notes, and text files here>
+    index/
     manifest.json
+    concepts.json
 ```
+
+`materials ingest` walks `.studyos/materials/raw/`, extracts text from `.md`, `.txt`, `.tex`, and `.pdf`, then writes only distilled snippets and tags into the manifest. StudyOS uses that distilled context to generate fresh teaching material rather than replaying source files verbatim.
 
 ## Repository Setup
 

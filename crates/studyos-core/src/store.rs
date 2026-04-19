@@ -4,10 +4,21 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::SessionRecapSummary;
+
+const LATEST_SCHEMA_VERSION: i64 = 2;
+const META_SCHEMA_VERSION_KEY: &str = "schema_version";
+
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_initial.sql")),
+    (
+        2,
+        include_str!("../migrations/0002_resume_thread_and_recap.sql"),
+    ),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppStats {
@@ -50,6 +61,18 @@ pub struct AttemptRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptAuditRecord {
+    pub id: String,
+    pub session_id: String,
+    pub concept_id: String,
+    pub question_type: String,
+    pub correctness: String,
+    pub reasoning_quality: String,
+    pub latency_ms: i64,
+    pub feedback_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MisconceptionInput {
     pub concept_id: String,
     pub error_type: String,
@@ -78,6 +101,22 @@ pub struct SessionRecapRecord {
     pub recap: SessionRecapSummary,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ConceptStateSnapshot {
+    mastery_estimate: f64,
+    retrieval_strength: f64,
+    stability_days: f64,
+    ease_factor: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConceptStateTransition {
+    next_state: ConceptStateSnapshot,
+    review_modifier: &'static str,
+    success: bool,
+}
+
+#[derive(Debug)]
 pub struct AppDatabase {
     connection: Connection,
 }
@@ -85,6 +124,7 @@ pub struct AppDatabase {
 impl AppDatabase {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
         let database = Self { connection };
         database.initialize_schema()?;
         Ok(database)
@@ -162,7 +202,6 @@ impl AppDatabase {
                 record.scratchpad_text,
             ],
         )?;
-
         Ok(())
     }
 
@@ -251,6 +290,37 @@ impl AppDatabase {
         }
 
         Ok(())
+    }
+
+    pub fn list_attempts_for_session(&self, session_id: &str) -> Result<Vec<AttemptAuditRecord>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT id, session_id, concept_id, question_type, correctness,
+                   reasoning_quality, latency_ms, feedback_summary
+            FROM attempts
+            WHERE session_id = ?1
+            ORDER BY rowid ASC
+            ",
+        )?;
+
+        let rows = statement.query_map(params![session_id], |row| {
+            Ok(AttemptAuditRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                concept_id: row.get(2)?,
+                question_type: row.get(3)?,
+                correctness: row.get(4)?,
+                reasoning_quality: row.get(5)?,
+                latency_ms: row.get(6)?,
+                feedback_summary: row.get(7)?,
+            })
+        })?;
+
+        let mut attempts = Vec::new();
+        for row in rows {
+            attempts.push(row?);
+        }
+        Ok(attempts)
     }
 
     pub fn resolve_concept_id(&self, candidates: &[String]) -> Result<Option<String>> {
@@ -362,6 +432,100 @@ impl AppDatabase {
             .transpose()
     }
 
+    fn initialize_schema(&self) -> Result<()> {
+        self.ensure_meta_table()?;
+        let current_version = self.detect_schema_version()?;
+        if current_version > LATEST_SCHEMA_VERSION {
+            return Err(anyhow!(
+                "database schema version {current_version} is newer than supported version {LATEST_SCHEMA_VERSION}"
+            ));
+        }
+
+        for (version, sql) in MIGRATIONS {
+            if *version > current_version {
+                self.connection.execute_batch(sql)?;
+                self.set_schema_version(*version)?;
+            }
+        }
+
+        self.seed_default_concepts()?;
+        Ok(())
+    }
+
+    fn ensure_meta_table(&self) -> Result<()> {
+        self.connection.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            ",
+        )?;
+        Ok(())
+    }
+
+    fn detect_schema_version(&self) -> Result<i64> {
+        if let Some(version) = self
+            .connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![META_SCHEMA_VERSION_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return version
+                .parse::<i64>()
+                .map_err(|error| anyhow!("invalid schema version `{version}`: {error}"));
+        }
+
+        if !self.table_exists("sessions")? {
+            return Ok(0);
+        }
+
+        if self.column_exists("sessions", "recap_payload")?
+            && self.column_exists("resume_state", "runtime_thread_id")?
+        {
+            self.set_schema_version(LATEST_SCHEMA_VERSION)?;
+            return Ok(LATEST_SCHEMA_VERSION);
+        }
+
+        Ok(1)
+    }
+
+    fn set_schema_version(&self, version: i64) -> Result<()> {
+        self.connection.execute(
+            "
+            INSERT INTO meta (key, value)
+            VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            ",
+            params![META_SCHEMA_VERSION_KEY, version.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn table_exists(&self, name: &str) -> Result<bool> {
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists == 1)
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let pragma = format!("PRAGMA table_info({table})");
+        let mut statement = self.connection.prepare(&pragma)?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        for entry in columns {
+            if entry? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn count_query(&self, sql: &str) -> Result<usize> {
         let count = self
             .connection
@@ -381,48 +545,40 @@ impl AppDatabase {
         Ok(())
     }
 
-    fn update_concept_state(&self, attempt: &AttemptRecord) -> Result<()> {
-        let (current_mastery, current_retrieval, current_stability, current_ease) =
-            self.connection.query_row(
+    fn concept_state_for(&self, concept_id: &str) -> Result<ConceptStateSnapshot> {
+        self.connection
+            .query_row(
                 "
-                SELECT mastery_estimate, retrieval_strength, stability_days, ease_factor
-                FROM concept_state
-                WHERE concept_id = ?1
-                ",
-                params![attempt.concept_id],
+            SELECT mastery_estimate, retrieval_strength, stability_days, ease_factor
+            FROM concept_state
+            WHERE concept_id = ?1
+            ",
+                params![concept_id],
                 |row| {
-                    Ok((
-                        row.get::<_, f64>(0)?,
-                        row.get::<_, f64>(1)?,
-                        row.get::<_, f64>(2)?,
-                        row.get::<_, f64>(3)?,
-                    ))
+                    Ok(ConceptStateSnapshot {
+                        mastery_estimate: row.get(0)?,
+                        retrieval_strength: row.get(1)?,
+                        stability_days: row.get(2)?,
+                        ease_factor: row.get(3)?,
+                    })
                 },
-            )?;
+            )
+            .map_err(Into::into)
+    }
 
-        let (mastery_delta, retrieval_delta, stability_delta, ease_delta, review_modifier, success) =
-            match (
-                attempt.correctness.as_str(),
-                attempt.reasoning_quality.as_str(),
-            ) {
-                ("correct", "strong") => (0.18, 0.22, 2.0, 0.06, "+5 day", true),
-                ("correct", "adequate") => (0.12, 0.16, 1.2, 0.03, "+3 day", true),
-                ("correct", _) => (0.07, 0.08, 0.6, 0.0, "+1 day", true),
-                ("partial", "adequate") => (0.03, -0.02, 0.2, -0.04, "+12 hour", false),
-                ("partial", _) => (0.01, -0.05, 0.0, -0.06, "+8 hour", false),
-                (_, _) => (-0.08, -0.14, -0.4, -0.1, "+4 hour", false),
-            };
-
-        let mastery_estimate = clamp(current_mastery + mastery_delta, 0.0, 1.0);
-        let retrieval_strength = clamp(current_retrieval + retrieval_delta, 0.0, 1.0);
-        let stability_days = clamp(current_stability + stability_delta, 0.0, 60.0);
-        let ease_factor = clamp(current_ease + ease_delta, 1.3, 3.0);
-        let success_timestamp = if success {
+    fn update_concept_state(&self, attempt: &AttemptRecord) -> Result<()> {
+        let current = self.concept_state_for(&attempt.concept_id)?;
+        let transition = concept_state_after_attempt(
+            current,
+            attempt.correctness.as_str(),
+            attempt.reasoning_quality.as_str(),
+        );
+        let success_timestamp = if transition.success {
             Some("datetime('now')")
         } else {
             None
         };
-        let failure_timestamp = if success {
+        let failure_timestamp = if transition.success {
             None
         } else {
             Some("datetime('now')")
@@ -447,11 +603,11 @@ impl AppDatabase {
             ),
             params![
                 attempt.concept_id,
-                mastery_estimate,
-                retrieval_strength,
-                review_modifier,
-                stability_days,
-                ease_factor,
+                transition.next_state.mastery_estimate,
+                transition.next_state.retrieval_strength,
+                transition.review_modifier,
+                transition.next_state.stability_days,
+                transition.next_state.ease_factor,
             ],
         )?;
 
@@ -511,134 +667,6 @@ impl AppDatabase {
         Ok(())
     }
 
-    fn initialize_schema(&self) -> Result<()> {
-        self.connection.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS concepts (
-                id TEXT PRIMARY KEY,
-                course TEXT NOT NULL,
-                name TEXT NOT NULL,
-                prerequisite_ids TEXT NOT NULL DEFAULT '[]',
-                tags TEXT NOT NULL DEFAULT '[]'
-            );
-
-            CREATE TABLE IF NOT EXISTS concept_state (
-                concept_id TEXT PRIMARY KEY,
-                mastery_estimate REAL NOT NULL DEFAULT 0.0,
-                retrieval_strength REAL NOT NULL DEFAULT 0.0,
-                last_seen_at TEXT,
-                last_success_at TEXT,
-                last_failure_at TEXT,
-                next_review_at TEXT,
-                stability_days REAL NOT NULL DEFAULT 0.0,
-                ease_factor REAL NOT NULL DEFAULT 2.5
-            );
-
-            CREATE TABLE IF NOT EXISTS misconceptions (
-                id TEXT PRIMARY KEY,
-                concept_id TEXT NOT NULL,
-                error_type TEXT NOT NULL,
-                description TEXT NOT NULL,
-                first_seen_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL,
-                resolved_at TEXT,
-                evidence_count INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS attempts (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                concept_id TEXT NOT NULL,
-                question_type TEXT NOT NULL,
-                prompt_hash TEXT NOT NULL,
-                student_answer TEXT NOT NULL,
-                correctness TEXT NOT NULL,
-                latency_ms INTEGER NOT NULL DEFAULT 0,
-                reasoning_quality TEXT NOT NULL DEFAULT 'unknown',
-                feedback_summary TEXT NOT NULL DEFAULT ''
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                planned_minutes INTEGER NOT NULL,
-                actual_minutes INTEGER,
-                mode TEXT NOT NULL,
-                outcome_summary TEXT NOT NULL DEFAULT '',
-                aborted_reason TEXT,
-                recap_payload TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS deadlines (
-                id TEXT PRIMARY KEY,
-                source TEXT NOT NULL,
-                title TEXT NOT NULL,
-                due_at TEXT NOT NULL,
-                course TEXT NOT NULL,
-                weight REAL NOT NULL DEFAULT 1.0,
-                notes TEXT NOT NULL DEFAULT ''
-            );
-
-            CREATE TABLE IF NOT EXISTS resume_state (
-                session_id TEXT PRIMARY KEY,
-                runtime_thread_id TEXT,
-                saved_at TEXT NOT NULL,
-                active_mode TEXT NOT NULL,
-                active_question_id TEXT,
-                focused_panel TEXT NOT NULL,
-                draft_payload TEXT NOT NULL DEFAULT '',
-                scratchpad_text TEXT NOT NULL DEFAULT ''
-            );
-            ",
-        )?;
-
-        self.migrate_resume_state()?;
-        self.migrate_sessions_recap_payload()?;
-        self.seed_default_concepts()?;
-        Ok(())
-    }
-
-    fn migrate_resume_state(&self) -> Result<()> {
-        let mut statement = self.connection.prepare("PRAGMA table_info(resume_state)")?;
-        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-        let mut has_runtime_thread_id = false;
-
-        for column in columns {
-            if column? == "runtime_thread_id" {
-                has_runtime_thread_id = true;
-            }
-        }
-
-        if !has_runtime_thread_id {
-            self.connection.execute(
-                "ALTER TABLE resume_state ADD COLUMN runtime_thread_id TEXT",
-                [],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn migrate_sessions_recap_payload(&self) -> Result<()> {
-        let mut statement = self.connection.prepare("PRAGMA table_info(sessions)")?;
-        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-        let mut has_recap_payload = false;
-
-        for column in columns {
-            if column? == "recap_payload" {
-                has_recap_payload = true;
-            }
-        }
-
-        if !has_recap_payload {
-            self.connection
-                .execute("ALTER TABLE sessions ADD COLUMN recap_payload TEXT", [])?;
-        }
-
-        Ok(())
-    }
-
     fn seed_default_concepts(&self) -> Result<()> {
         let concepts = [
             (
@@ -676,6 +704,33 @@ impl AppDatabase {
     }
 }
 
+fn concept_state_after_attempt(
+    current: ConceptStateSnapshot,
+    correctness: &str,
+    reasoning_quality: &str,
+) -> ConceptStateTransition {
+    let (mastery_delta, retrieval_delta, stability_delta, ease_delta, review_modifier, success) =
+        match (correctness, reasoning_quality) {
+            ("correct", "strong") => (0.18, 0.22, 2.0, 0.06, "+5 day", true),
+            ("correct", "adequate") => (0.12, 0.16, 1.2, 0.03, "+3 day", true),
+            ("correct", _) => (0.07, 0.08, 0.6, 0.0, "+1 day", true),
+            ("partial", "adequate") => (0.03, -0.02, 0.2, -0.04, "+12 hour", false),
+            ("partial", _) => (0.01, -0.05, 0.0, -0.06, "+8 hour", false),
+            _ => (-0.08, -0.14, -0.4, -0.1, "+4 hour", false),
+        };
+
+    ConceptStateTransition {
+        next_state: ConceptStateSnapshot {
+            mastery_estimate: clamp(current.mastery_estimate + mastery_delta, 0.0, 1.0),
+            retrieval_strength: clamp(current.retrieval_strength + retrieval_delta, 0.0, 1.0),
+            stability_days: clamp(current.stability_days + stability_delta, 0.0, 60.0),
+            ease_factor: clamp(current.ease_factor + ease_delta, 1.3, 3.0),
+        },
+        review_modifier,
+        success,
+    }
+}
+
 fn make_record_id(prefix: &str, seed: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     seed.hash(&mut hasher);
@@ -695,11 +750,15 @@ fn clamp(value: f64, min: f64, max: f64) -> f64 {
 mod tests {
     use std::{env, fs};
 
+    use proptest::prelude::*;
+    use rusqlite::{Connection, params};
+
     use crate::SessionRecapSummary;
 
     use super::{
-        AppDatabase, AttemptRecord, MisconceptionInput, ResumeStateRecord, SessionRecapRecord,
-        SessionRecord,
+        AppDatabase, AttemptRecord, ConceptStateSnapshot, LATEST_SCHEMA_VERSION,
+        META_SCHEMA_VERSION_KEY, MisconceptionInput, ResumeStateRecord, SessionRecapRecord,
+        SessionRecord, concept_state_after_attempt,
     };
 
     fn temp_db_dir() -> std::path::PathBuf {
@@ -712,6 +771,17 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("failed to create temp dir: {err}"));
         dir
+    }
+
+    fn attempt_case_strategy() -> impl Strategy<Value = (&'static str, &'static str)> {
+        prop_oneof![
+            Just(("correct", "strong")),
+            Just(("correct", "adequate")),
+            Just(("correct", "weak")),
+            Just(("partial", "adequate")),
+            Just(("partial", "missing")),
+            Just(("incorrect", "missing")),
+        ]
     }
 
     #[test]
@@ -746,7 +816,7 @@ mod tests {
                 active_mode: "Study".to_string(),
                 active_question_id: Some("4".to_string()),
                 focused_panel: "Scratchpad".to_string(),
-                draft_payload: "draft = true".to_string(),
+                draft_payload: "{\"draft\":true}".to_string(),
                 scratchpad_text: "rough working".to_string(),
             };
 
@@ -872,5 +942,143 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn repeated_identical_misconception_does_not_duplicate() {
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        let database =
+            AppDatabase::open(&path).unwrap_or_else(|err| panic!("database open failed: {err}"));
+        database
+            .start_session(&SessionRecord {
+                id: "session-1".to_string(),
+                planned_minutes: 30,
+                mode: "Study".to_string(),
+            })
+            .unwrap_or_else(|err| panic!("session start failed: {err}"));
+
+        for index in 0..2 {
+            database
+                .record_attempt(
+                    &AttemptRecord {
+                        id: format!("attempt-{index}"),
+                        session_id: "session-1".to_string(),
+                        concept_id: "matrix_multiplication_dims".to_string(),
+                        question_type: "retrieval_response".to_string(),
+                        prompt_hash: format!("hash-{index}"),
+                        student_answer: "wrong".to_string(),
+                        correctness: "incorrect".to_string(),
+                        latency_ms: 500,
+                        reasoning_quality: "missing".to_string(),
+                        feedback_summary: "Still confused.".to_string(),
+                    },
+                    Some(&MisconceptionInput {
+                        concept_id: "matrix_multiplication_dims".to_string(),
+                        error_type: "conceptual_misunderstanding".to_string(),
+                        description: "Confused inner and outer dimensions.".to_string(),
+                    }),
+                )
+                .unwrap_or_else(|err| panic!("attempt record failed: {err}"));
+        }
+
+        let misconceptions = database
+            .list_recent_misconceptions(5)
+            .unwrap_or_else(|err| panic!("misconception query failed: {err}"));
+        assert_eq!(misconceptions.len(), 1);
+        assert_eq!(misconceptions[0].evidence_count, 2);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn schema_version_refuses_newer_db() {
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        let connection =
+            Connection::open(&path).unwrap_or_else(|err| panic!("sqlite open failed: {err}"));
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta (key, value) VALUES ('schema_version', '999');
+                ",
+            )
+            .unwrap_or_else(|err| panic!("meta seed failed: {err}"));
+
+        let error = AppDatabase::open(&path).expect_err("newer schema should be rejected");
+        assert!(error.to_string().contains("newer than supported"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_schema_upgrades_forward() {
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        let connection =
+            Connection::open(&path).unwrap_or_else(|err| panic!("sqlite open failed: {err}"));
+        connection
+            .execute_batch(include_str!("../migrations/0001_initial.sql"))
+            .unwrap_or_else(|err| panic!("initial migration seed failed: {err}"));
+
+        let database =
+            AppDatabase::open(&path).unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let loaded = database
+            .load_resume_state()
+            .unwrap_or_else(|err| panic!("resume load failed: {err}"));
+        assert!(loaded.is_none());
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![META_SCHEMA_VERSION_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_else(|err| panic!("schema version read failed: {err}")),
+            LATEST_SCHEMA_VERSION.to_string()
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn correct_attempts_raise_mastery_and_incorrect_attempts_lower_it() {
+        let mut state = ConceptStateSnapshot {
+            mastery_estimate: 0.5,
+            retrieval_strength: 0.5,
+            stability_days: 3.0,
+            ease_factor: 2.5,
+        };
+        for _ in 0..8 {
+            state = concept_state_after_attempt(state, "correct", "strong").next_state;
+        }
+        assert!(state.mastery_estimate > 0.9);
+
+        for _ in 0..8 {
+            state = concept_state_after_attempt(state, "incorrect", "missing").next_state;
+        }
+        assert!(state.mastery_estimate < 0.5);
+    }
+
+    proptest! {
+        #[test]
+        fn mastery_retrieval_and_ease_stay_in_range(sequence in prop::collection::vec(attempt_case_strategy(), 1..64)) {
+            let mut state = ConceptStateSnapshot {
+                mastery_estimate: 0.0,
+                retrieval_strength: 0.0,
+                stability_days: 0.0,
+                ease_factor: 2.5,
+            };
+
+            for (correctness, reasoning_quality) in sequence {
+                state = concept_state_after_attempt(state, correctness, reasoning_quality).next_state;
+                prop_assert!((0.0..=1.0).contains(&state.mastery_estimate));
+                prop_assert!((0.0..=1.0).contains(&state.retrieval_strength));
+                prop_assert!((0.0..=60.0).contains(&state.stability_days));
+                prop_assert!((1.3..=3.0).contains(&state.ease_factor));
+            }
+        }
     }
 }

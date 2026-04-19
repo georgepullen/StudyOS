@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     AppConfig, AppStats,
@@ -45,6 +46,7 @@ pub enum PanelTab {
     Misconceptions,
     Scratchpad,
     Activity,
+    RuntimeLog,
 }
 
 impl PanelTab {
@@ -56,6 +58,7 @@ impl PanelTab {
             Self::Misconceptions => "Misconceptions",
             Self::Scratchpad => "Scratchpad",
             Self::Activity => "Activity",
+            Self::RuntimeLog => "Runtime Log",
         }
     }
 
@@ -66,6 +69,7 @@ impl PanelTab {
             "Misconceptions" => Self::Misconceptions,
             "Scratchpad" => Self::Scratchpad,
             "Activity" => Self::Activity,
+            "Runtime Log" => Self::RuntimeLog,
             _ => Self::SessionPlan,
         }
     }
@@ -89,8 +93,35 @@ impl DeadlineUrgency {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowSource {
+    TimetableGap,
+    BeforeDeadline,
+    EveningBlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StudyWindow {
+    pub start: String,
+    pub duration_minutes: u16,
+    pub source: WindowSource,
+}
+
+impl StudyWindow {
+    pub fn label(&self) -> &'static str {
+        match self.source {
+            WindowSource::TimetableGap => "timetable gap",
+            WindowSource::BeforeDeadline => "deadline run-up",
+            WindowSource::EveningBlock => "evening block",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPlanSummary {
     pub recommended_duration_minutes: u16,
+    #[serde(default)]
+    pub window: Option<StudyWindow>,
     pub why_now: String,
     pub warm_up_questions: Vec<String>,
     pub core_targets: Vec<String>,
@@ -123,6 +154,7 @@ pub struct BootstrapStudyContext {
     pub due_reviews: Vec<StartupReviewItem>,
     pub recent_misconceptions: Vec<StartupMisconceptionItem>,
     pub last_session_recap: Option<SessionRecapSummary>,
+    pub study_window: Option<StudyWindow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,7 +225,7 @@ impl AppSnapshot {
         Self {
             mode,
             course: config.default_course.clone(),
-            time_remaining_minutes: config.default_session_minutes,
+            time_remaining_minutes: plan.recommended_duration_minutes,
             panel_tab,
             deadline_urgency: urgency,
             metrics: SessionMetrics {
@@ -233,7 +265,7 @@ impl AppSnapshot {
                     description: "cycle focus",
                 },
                 KeybindingHint {
-                    key: "1-6",
+                    key: "1-7",
                     description: "switch panel tab",
                 },
                 KeybindingHint {
@@ -425,17 +457,30 @@ fn build_start_plan(
     mode: SessionMode,
     urgency: DeadlineUrgency,
 ) -> SessionPlanSummary {
+    let recommended_duration_minutes = study_context
+        .study_window
+        .as_ref()
+        .map(|window| config.default_session_minutes.min(window.duration_minutes))
+        .unwrap_or(config.default_session_minutes);
+    let window_prefix = study_context
+        .study_window
+        .as_ref()
+        .map(describe_window)
+        .unwrap_or_default();
+
     match mode {
         SessionMode::Review => SessionPlanSummary {
-            recommended_duration_minutes: config.default_session_minutes.min(35),
+            recommended_duration_minutes: recommended_duration_minutes.min(35),
+            window: study_context.study_window.clone(),
             why_now: if !study_context.recent_misconceptions.is_empty() {
                 format!(
-                    "You have active repair work to revisit, starting with {}.",
+                    "{window_prefix}You have active repair work to revisit, starting with {}.",
                     study_context.recent_misconceptions[0].concept_name
                 )
             } else {
-                "You have due retrieval items queued, so the session should repair memory before novelty."
-                    .to_string()
+                format!(
+                    "{window_prefix}You have due retrieval items queued, so the session should repair memory before novelty."
+                )
             },
             warm_up_questions: study_context
                 .due_reviews
@@ -461,10 +506,11 @@ fn build_start_plan(
             ),
         },
         SessionMode::Drill => SessionPlanSummary {
-            recommended_duration_minutes: config.default_session_minutes.min(30),
-            why_now:
-                "A deadline is close enough that this opener should feel exam-like and time-aware."
-                    .to_string(),
+            recommended_duration_minutes: recommended_duration_minutes.min(30),
+            window: study_context.study_window.clone(),
+            why_now: format!(
+                "{window_prefix}A deadline is close enough that this opener should feel exam-like and time-aware."
+            ),
             warm_up_questions: vec![
                 "Predict the output dimensions before you compute anything.".to_string(),
                 "State the most common exam-time failure mode for this topic.".to_string(),
@@ -482,25 +528,30 @@ fn build_start_plan(
             }),
         },
         _ => SessionPlanSummary {
-            recommended_duration_minutes: config.default_session_minutes,
+            recommended_duration_minutes,
+            window: study_context.study_window.clone(),
             why_now: if let Some(recap) = &study_context.last_session_recap {
                 if let Some(objective) = recap.unfinished_objectives.first() {
                     format!(
-                        "Last session ended with unfinished work, so restart by stabilizing: {objective}."
+                        "{window_prefix}Last session ended with unfinished work, so restart by stabilizing: {objective}."
                     )
                 } else if stats.due_reviews > 0 {
-                    "You have some memory pressure, but not enough to force a full review block, so start with retrieval and then progress."
-                        .to_string()
+                    format!(
+                        "{window_prefix}You have some memory pressure, but not enough to force a full review block, so start with retrieval and then progress."
+                    )
                 } else {
-                    "No urgent repair queue yet, so this session should establish or extend fluent understanding with retrieval-first warmups."
-                        .to_string()
+                    format!(
+                        "{window_prefix}No urgent repair queue yet, so this session should establish or extend fluent understanding with retrieval-first warmups."
+                    )
                 }
             } else if stats.due_reviews > 0 {
-                "You have some memory pressure, but not enough to force a full review block, so start with retrieval and then progress."
-                    .to_string()
+                format!(
+                    "{window_prefix}You have some memory pressure, but not enough to force a full review block, so start with retrieval and then progress."
+                )
             } else {
-                "No urgent repair queue yet, so this session should establish or extend fluent understanding with retrieval-first warmups."
-                    .to_string()
+                format!(
+                    "{window_prefix}No urgent repair queue yet, so this session should establish or extend fluent understanding with retrieval-first warmups."
+                )
             },
             warm_up_questions: vec![
                 study_context
@@ -529,6 +580,19 @@ fn build_start_plan(
     }
 }
 
+fn describe_window(window: &StudyWindow) -> String {
+    let start = OffsetDateTime::parse(&window.start, &Rfc3339)
+        .ok()
+        .map(|time| format!("{:02}:{:02}", time.hour(), time.minute()))
+        .unwrap_or_else(|| window.start.clone());
+    format!(
+        "You have a {}-minute {} window starting at {}; adapt the session to fit that constraint. ",
+        window.duration_minutes,
+        window.label(),
+        start
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +619,7 @@ mod tests {
                 }],
                 recent_misconceptions: Vec::new(),
                 last_session_recap: None,
+                study_window: None,
             },
         );
 
@@ -590,6 +655,7 @@ mod tests {
                         "Rebuild the inner-dimension rule for matrix multiplication.".to_string(),
                     ],
                 }),
+                study_window: None,
             },
         );
 
@@ -633,5 +699,50 @@ mod tests {
                 .iter()
                 .any(|tag| tag == "expectation")
         );
+    }
+
+    #[test]
+    fn short_window_reduces_recommended_duration() {
+        let config = AppConfig::default();
+        let window = StudyWindow {
+            start: "2026-04-19T14:45:00Z".to_string(),
+            duration_minutes: 15,
+            source: WindowSource::TimetableGap,
+        };
+        let snapshot = AppSnapshot::bootstrap(
+            &config,
+            &stats(0, 0, 0),
+            &BootstrapStudyContext {
+                study_window: Some(window.clone()),
+                ..BootstrapStudyContext::default()
+            },
+        );
+
+        assert_eq!(snapshot.plan.recommended_duration_minutes, 15);
+        assert_eq!(snapshot.plan.window, Some(window));
+        assert!(snapshot.plan.why_now.contains("15-minute"));
+    }
+
+    #[test]
+    fn long_window_keeps_default_duration() {
+        let config = AppConfig::default();
+        let snapshot = AppSnapshot::bootstrap(
+            &config,
+            &stats(0, 0, 0),
+            &BootstrapStudyContext {
+                study_window: Some(StudyWindow {
+                    start: "2026-04-19T20:00:00Z".to_string(),
+                    duration_minutes: 90,
+                    source: WindowSource::EveningBlock,
+                }),
+                ..BootstrapStudyContext::default()
+            },
+        );
+
+        assert_eq!(
+            snapshot.plan.recommended_duration_minutes,
+            config.default_session_minutes
+        );
+        assert!(snapshot.plan.why_now.contains("90-minute"));
     }
 }

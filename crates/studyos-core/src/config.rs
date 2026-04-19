@@ -100,12 +100,17 @@ impl AppConfig {
 pub struct AppPaths {
     pub root_dir: PathBuf,
     pub data_dir: PathBuf,
+    pub logs_dir: PathBuf,
     pub config_path: PathBuf,
     pub database_path: PathBuf,
     pub courses_dir: PathBuf,
     pub deadlines_path: PathBuf,
     pub timetable_path: PathBuf,
     pub materials_dir: PathBuf,
+    pub materials_raw_dir: PathBuf,
+    pub materials_index_dir: PathBuf,
+    pub materials_manifest_path: PathBuf,
+    pub materials_concepts_path: PathBuf,
 }
 
 impl AppPaths {
@@ -114,13 +119,21 @@ impl AppPaths {
             .map(PathBuf::from)
             .unwrap_or_else(|| base_dir.join(".studyos"));
 
+        let materials_dir = root_dir.join("materials");
+        let materials_raw_dir = materials_dir.join("raw");
+        let materials_index_dir = materials_dir.join("index");
         Self {
+            logs_dir: root_dir.join("logs"),
             config_path: root_dir.join("config.toml"),
             database_path: root_dir.join("studyos.db"),
             courses_dir: root_dir.join("courses"),
             deadlines_path: root_dir.join("deadlines.json"),
             timetable_path: root_dir.join("timetable.json"),
-            materials_dir: root_dir.join("materials"),
+            materials_manifest_path: materials_dir.join("manifest.json"),
+            materials_concepts_path: materials_dir.join("concepts.json"),
+            materials_dir,
+            materials_raw_dir,
+            materials_index_dir,
             data_dir: root_dir.clone(),
             root_dir,
         }
@@ -128,8 +141,11 @@ impl AppPaths {
 
     pub fn ensure(&self) -> Result<()> {
         fs::create_dir_all(&self.data_dir)?;
+        fs::create_dir_all(&self.logs_dir)?;
         fs::create_dir_all(&self.courses_dir)?;
         fs::create_dir_all(&self.materials_dir)?;
+        fs::create_dir_all(&self.materials_raw_dir)?;
+        fs::create_dir_all(&self.materials_index_dir)?;
         Ok(())
     }
 }
@@ -166,8 +182,11 @@ mod tests {
             .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
 
         assert!(paths.data_dir.exists());
+        assert!(paths.logs_dir.exists());
         assert!(paths.courses_dir.exists());
         assert!(paths.materials_dir.exists());
+        assert!(paths.materials_raw_dir.exists());
+        assert!(paths.materials_index_dir.exists());
 
         let _ = fs::remove_dir_all(&root);
     }
