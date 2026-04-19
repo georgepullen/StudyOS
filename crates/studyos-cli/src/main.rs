@@ -187,7 +187,7 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
     println!("loaded_materials: {}", local_context.materials.len());
     println!("loaded_courses: {}", local_context.courses.courses.len());
     println!("resume_state_present: {}", resume.is_some());
-    println!("app_server: {}", app_server);
+    println!("app_server: {app_server}");
 
     Ok(())
 }

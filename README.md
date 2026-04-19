@@ -103,8 +103,14 @@ Detailed V1 implementation docs live in:
 
 Prerequisites:
 
-- Rust stable
-- local `codex` CLI installed and authenticated
+- Rust `1.88.0`
+- local `codex-cli 0.121.0` or newer installed and authenticated
+
+Sanity check the workspace:
+
+```bash
+just check
+```
 
 Run:
 

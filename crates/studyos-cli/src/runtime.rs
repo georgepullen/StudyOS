@@ -274,7 +274,7 @@ impl AppServerClient {
                 .stdin
                 .lock()
                 .map_err(|_| anyhow!("app-server stdin lock poisoned"))?;
-            writeln!(stdin, "{}", message)?;
+            writeln!(stdin, "{message}")?;
             stdin.flush()?;
         }
 
@@ -305,7 +305,7 @@ impl AppServerClient {
             .stdin
             .lock()
             .map_err(|_| anyhow!("app-server stdin lock poisoned"))?;
-        writeln!(stdin, "{}", message)?;
+        writeln!(stdin, "{message}")?;
         stdin.flush()?;
         Ok(())
     }

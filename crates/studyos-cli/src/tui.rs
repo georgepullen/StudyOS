@@ -164,7 +164,7 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
             }
             ContentBlock::BulletList(items) => {
                 for item in items {
-                    lines.push(Line::from(format!("• {}", item)));
+                    lines.push(Line::from(format!("• {item}")));
                 }
             }
             ContentBlock::MathBlock(math) => {
@@ -218,7 +218,7 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
                     Style::default().fg(Color::LightBlue),
                 )));
                 for item in &boxed.highlights {
-                    lines.push(Line::from(format!("  - {}", item)));
+                    lines.push(Line::from(format!("  - {item}")));
                 }
             }
             ContentBlock::Divider => lines.push(Line::from("")),
@@ -277,7 +277,7 @@ fn session_plan_lines(plan: &SessionPlanSummary) -> Vec<Line<'static>> {
     ];
 
     for question in &plan.warm_up_questions {
-        lines.push(Line::from(format!("• {}", question)));
+        lines.push(Line::from(format!("• {question}")));
     }
 
     lines.push(Line::from(""));
@@ -287,7 +287,7 @@ fn session_plan_lines(plan: &SessionPlanSummary) -> Vec<Line<'static>> {
     )));
 
     for target in &plan.core_targets {
-        lines.push(Line::from(format!("• {}", target)));
+        lines.push(Line::from(format!("• {target}")));
     }
 
     if let Some(stretch) = &plan.stretch_target {
@@ -296,7 +296,7 @@ fn session_plan_lines(plan: &SessionPlanSummary) -> Vec<Line<'static>> {
             "Stretch",
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(format!("• {}", stretch)));
+        lines.push(Line::from(format!("• {stretch}")));
     }
 
     lines

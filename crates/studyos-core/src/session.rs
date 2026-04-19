@@ -486,8 +486,7 @@ fn build_start_plan(
             why_now: if let Some(recap) = &study_context.last_session_recap {
                 if let Some(objective) = recap.unfinished_objectives.first() {
                     format!(
-                        "Last session ended with unfinished work, so restart by stabilizing: {}.",
-                        objective
+                        "Last session ended with unfinished work, so restart by stabilizing: {objective}."
                     )
                 } else if stats.due_reviews > 0 {
                     "You have some memory pressure, but not enough to force a full review block, so start with retrieval and then progress."

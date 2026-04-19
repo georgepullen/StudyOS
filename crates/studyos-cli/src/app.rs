@@ -1089,7 +1089,7 @@ impl App {
                 self.runtime_thread_id = Some(thread_id.clone());
                 self.set_activity(
                     "App-server",
-                    format!("Thread ready: {}", thread_id),
+                    format!("Thread ready: {thread_id}"),
                     ActivityStatus::Running,
                 );
             }
@@ -1317,7 +1317,7 @@ impl App {
             Err(error) => {
                 self.push_block(ContentBlock::WarningBox(WarningBox {
                     title: "Structured payload parse failed".to_string(),
-                    body: format!("{} | Raw response: {}", error, raw),
+                    body: format!("{error} | Raw response: {raw}"),
                 }));
             }
         }
