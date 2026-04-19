@@ -193,12 +193,12 @@ impl AppDatabase {
                     Ok(ResumeStateRecord {
                         session_id: row.get(0)?,
                         runtime_thread_id: row.get(1)?,
-                        active_course: row.get(2)?,
-                        active_mode: row.get(3)?,
+                        active_course: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        active_mode: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                         active_question_id: row.get(4)?,
-                        focused_panel: row.get(5)?,
-                        draft_payload: row.get(6)?,
-                        scratchpad_text: row.get(7)?,
+                        focused_panel: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                        draft_payload: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                        scratchpad_text: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
                     })
                 },
             )
@@ -1641,6 +1641,46 @@ mod tests {
                 .unwrap_or_else(|err| panic!("schema version read failed: {err}")),
             LATEST_SCHEMA_VERSION.to_string()
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_resume_state_tolerates_null_course_fields_from_older_rows() {
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        let database =
+            AppDatabase::open(&path).unwrap_or_else(|err| panic!("database open failed: {err}"));
+
+        database
+            .connection
+            .execute(
+                "
+                INSERT INTO resume_state (
+                    session_id, runtime_thread_id, active_course, saved_at,
+                    active_mode, active_question_id, focused_panel, draft_payload, scratchpad_text
+                )
+                VALUES (?1, ?2, NULL, datetime('now'), 'study', NULL, 'plan', '', '')
+                ",
+                params!["session-null-course", "thread-null-course"],
+            )
+            .unwrap_or_else(|err| panic!("resume seed failed: {err}"));
+
+        let loaded = database
+            .load_resume_state()
+            .unwrap_or_else(|err| panic!("resume load failed: {err}"))
+            .unwrap_or_else(|| panic!("expected resume state row"));
+
+        assert_eq!(loaded.session_id, "session-null-course");
+        assert_eq!(
+            loaded.runtime_thread_id.as_deref(),
+            Some("thread-null-course")
+        );
+        assert_eq!(loaded.active_course, "");
+        assert_eq!(loaded.active_mode, "study");
+        assert_eq!(loaded.focused_panel, "plan");
+        assert_eq!(loaded.draft_payload, "");
+        assert_eq!(loaded.scratchpad_text, "");
 
         let _ = fs::remove_dir_all(dir);
     }

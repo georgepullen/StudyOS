@@ -489,7 +489,13 @@ pub fn ingest_materials(paths: &AppPaths, courses: &CourseCatalog) -> Result<Mat
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| relative_path.clone());
         let topic_tags = derive_topic_tags(&title, &extracted_text, courses);
-        let course = infer_course(&title, &extracted_text, courses, &topic_tags);
+        let course = infer_course(
+            &relative_path,
+            &title,
+            &extracted_text,
+            courses,
+            &topic_tags,
+        );
         let material_type = infer_material_type(&path);
 
         let entry = MaterialEntry {
@@ -689,14 +695,29 @@ fn derive_topic_tags(title: &str, text: &str, courses: &CourseCatalog) -> Vec<St
     tags
 }
 
-fn infer_course(title: &str, text: &str, courses: &CourseCatalog, topic_tags: &[String]) -> String {
-    let haystack = format!("{title} {text} {}", topic_tags.join(" ")).to_lowercase();
+fn infer_course(
+    relative_path: &str,
+    title: &str,
+    text: &str,
+    courses: &CourseCatalog,
+    topic_tags: &[String],
+) -> String {
+    let haystack =
+        format!("{relative_path} {title} {text} {}", topic_tags.join(" ")).to_lowercase();
     let mut best_course = None::<(&str, usize)>;
 
     for course in &courses.courses {
         let mut score = 0usize;
+        if haystack.contains(&normalize_lookup_token(&course.course_id)) {
+            score += 4;
+        }
         if haystack.contains(&course.title.to_lowercase()) {
             score += 3;
+        }
+        for keyword in course_lookup_keywords(course) {
+            if haystack.contains(&keyword) {
+                score += 2;
+            }
         }
         for concept in &course.concepts {
             if haystack.contains(&concept.title.to_lowercase()) {
@@ -717,6 +738,42 @@ fn infer_course(title: &str, text: &str, courses: &CourseCatalog, topic_tags: &[
         .filter(|(_, score)| *score > 0)
         .map(|(title, _)| title.to_string())
         .unwrap_or_else(|| "Uncategorized".to_string())
+}
+
+fn course_lookup_keywords(course: &crate::CourseDefinition) -> Vec<String> {
+    let mut keywords = HashSet::new();
+    keywords.insert(normalize_lookup_token(&course.course_id));
+
+    for token in course
+        .title
+        .split(|character: char| !character.is_alphanumeric())
+        .map(normalize_lookup_token)
+        .filter(|token| token.len() >= 4)
+    {
+        keywords.insert(token);
+    }
+
+    let title = course.title.to_lowercase();
+    if title.contains("matrix algebra") || title.contains("linear models") {
+        keywords.insert("matrix".to_string());
+        keywords.insert("linear models".to_string());
+        keywords.insert("matrix algebra".to_string());
+        keywords.insert("eigenvalues".to_string());
+        keywords.insert("eigenvectors".to_string());
+        keywords.insert("orthogonal".to_string());
+        keywords.insert("projection".to_string());
+        keywords.insert("qr".to_string());
+    }
+    if title.contains("probability") || title.contains("statistics") {
+        keywords.insert("probability".to_string());
+        keywords.insert("statistics".to_string());
+        keywords.insert("stats".to_string());
+        keywords.insert("probstats".to_string());
+        keywords.insert("covariance".to_string());
+        keywords.insert("distribution".to_string());
+    }
+
+    keywords.into_iter().collect()
 }
 
 fn infer_material_type(path: &Path) -> String {
@@ -955,6 +1012,35 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "variance-notes");
+    }
+
+    #[test]
+    fn materials_ingest_infers_course_from_relative_path_keywords() {
+        let base = temp_data_root("course-infer-path");
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("paths ensure failed: {err}"));
+
+        let source_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/materials/raw/linear-models.pdf");
+        let target_dir = paths.materials_raw_dir.join("12th_may_matrix");
+        fs::create_dir_all(&target_dir)
+            .unwrap_or_else(|err| panic!("target dir create failed: {err}"));
+        fs::copy(&source_fixture, target_dir.join("Document.pdf"))
+            .unwrap_or_else(|err| panic!("fixture copy failed: {err}"));
+
+        let manifest = ingest_materials(&paths, &sample_catalog())
+            .unwrap_or_else(|err| panic!("materials ingest failed: {err}"));
+        let document = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "12th_may_matrix/Document.pdf")
+            .unwrap_or_else(|| panic!("expected Document.pdf to be indexed"));
+
+        assert_eq!(document.course, "Matrix Algebra & Linear Models");
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
