@@ -5,11 +5,11 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::SessionRecapSummary;
 
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const LATEST_SCHEMA_VERSION: i64 = 3;
 const META_SCHEMA_VERSION_KEY: &str = "schema_version";
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -17,6 +17,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         2,
         include_str!("../migrations/0002_resume_thread_and_recap.sql"),
+    ),
+    (
+        3,
+        include_str!("../migrations/0003_misconception_candidates.sql"),
     ),
 ];
 
@@ -93,6 +97,7 @@ pub struct MisconceptionSummary {
     pub description: String,
     pub last_seen_at: String,
     pub evidence_count: usize,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,7 +265,8 @@ impl AppDatabase {
         attempt: &AttemptRecord,
         misconception: Option<&MisconceptionInput>,
     ) -> Result<()> {
-        self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
             "
             INSERT INTO attempts (
                 id, session_id, concept_id, question_type, prompt_hash, student_answer,
@@ -282,13 +288,14 @@ impl AppDatabase {
             ],
         )?;
 
-        self.ensure_concept_state(&attempt.concept_id)?;
-        self.update_concept_state(attempt)?;
+        ensure_concept_state_in(&transaction, &attempt.concept_id)?;
+        update_concept_state_in(&transaction, attempt)?;
 
         if let Some(misconception) = misconception {
-            self.upsert_misconception(misconception)?;
+            stage_misconception_candidate_in(&transaction, attempt.id.as_str(), misconception)?;
         }
 
+        transaction.commit()?;
         Ok(())
     }
 
@@ -401,6 +408,55 @@ impl AppDatabase {
                 description: row.get(2)?,
                 last_seen_at: row.get(3)?,
                 evidence_count: row.get::<_, i64>(4)? as usize,
+                status: "confirmed".to_string(),
+            })
+        })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
+    pub fn list_recent_repair_signals(&self, limit: usize) -> Result<Vec<MisconceptionSummary>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT concept_name, error_type, description, last_seen_at, evidence_count, status
+            FROM (
+                SELECT concepts.name AS concept_name,
+                       misconceptions.error_type AS error_type,
+                       misconceptions.description AS description,
+                       misconceptions.last_seen_at AS last_seen_at,
+                       misconceptions.evidence_count AS evidence_count,
+                       'confirmed' AS status
+                FROM misconceptions
+                INNER JOIN concepts ON concepts.id = misconceptions.concept_id
+                WHERE misconceptions.resolved_at IS NULL
+                UNION ALL
+                SELECT concepts.name AS concept_name,
+                       misconception_candidates.error_type AS error_type,
+                       misconception_candidates.description AS description,
+                       misconception_candidates.last_seen_at AS last_seen_at,
+                       misconception_candidates.evidence_count AS evidence_count,
+                       'candidate' AS status
+                FROM misconception_candidates
+                INNER JOIN concepts ON concepts.id = misconception_candidates.concept_id
+                WHERE misconception_candidates.status = 'pending'
+            )
+            ORDER BY last_seen_at DESC
+            LIMIT ?1
+            ",
+        )?;
+
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(MisconceptionSummary {
+                concept_name: row.get(0)?,
+                error_type: row.get(1)?,
+                description: row.get(2)?,
+                last_seen_at: row.get(3)?,
+                evidence_count: row.get::<_, i64>(4)? as usize,
+                status: row.get(5)?,
             })
         })?;
 
@@ -486,8 +542,14 @@ impl AppDatabase {
         if self.column_exists("sessions", "recap_payload")?
             && self.column_exists("resume_state", "runtime_thread_id")?
         {
-            self.set_schema_version(LATEST_SCHEMA_VERSION)?;
-            return Ok(LATEST_SCHEMA_VERSION);
+            if self.table_exists("misconception_candidates")?
+                && self.table_exists("misconception_decisions")?
+            {
+                self.set_schema_version(LATEST_SCHEMA_VERSION)?;
+                return Ok(LATEST_SCHEMA_VERSION);
+            }
+            self.set_schema_version(2)?;
+            return Ok(2);
         }
 
         Ok(1)
@@ -533,140 +595,6 @@ impl AppDatabase {
         Ok(count as usize)
     }
 
-    fn ensure_concept_state(&self, concept_id: &str) -> Result<()> {
-        self.connection.execute(
-            "
-            INSERT INTO concept_state (concept_id)
-            VALUES (?1)
-            ON CONFLICT(concept_id) DO NOTHING
-            ",
-            params![concept_id],
-        )?;
-        Ok(())
-    }
-
-    fn concept_state_for(&self, concept_id: &str) -> Result<ConceptStateSnapshot> {
-        self.connection
-            .query_row(
-                "
-            SELECT mastery_estimate, retrieval_strength, stability_days, ease_factor
-            FROM concept_state
-            WHERE concept_id = ?1
-            ",
-                params![concept_id],
-                |row| {
-                    Ok(ConceptStateSnapshot {
-                        mastery_estimate: row.get(0)?,
-                        retrieval_strength: row.get(1)?,
-                        stability_days: row.get(2)?,
-                        ease_factor: row.get(3)?,
-                    })
-                },
-            )
-            .map_err(Into::into)
-    }
-
-    fn update_concept_state(&self, attempt: &AttemptRecord) -> Result<()> {
-        let current = self.concept_state_for(&attempt.concept_id)?;
-        let transition = concept_state_after_attempt(
-            current,
-            attempt.correctness.as_str(),
-            attempt.reasoning_quality.as_str(),
-        );
-        let success_timestamp = if transition.success {
-            Some("datetime('now')")
-        } else {
-            None
-        };
-        let failure_timestamp = if transition.success {
-            None
-        } else {
-            Some("datetime('now')")
-        };
-
-        self.connection.execute(
-            &format!(
-                "
-                UPDATE concept_state
-                SET mastery_estimate = ?2,
-                    retrieval_strength = ?3,
-                    last_seen_at = datetime('now'),
-                    last_success_at = {},
-                    last_failure_at = {},
-                    next_review_at = datetime('now', ?4),
-                    stability_days = ?5,
-                    ease_factor = ?6
-                WHERE concept_id = ?1
-                ",
-                success_timestamp.unwrap_or("last_success_at"),
-                failure_timestamp.unwrap_or("last_failure_at"),
-            ),
-            params![
-                attempt.concept_id,
-                transition.next_state.mastery_estimate,
-                transition.next_state.retrieval_strength,
-                transition.review_modifier,
-                transition.next_state.stability_days,
-                transition.next_state.ease_factor,
-            ],
-        )?;
-
-        Ok(())
-    }
-
-    fn upsert_misconception(&self, misconception: &MisconceptionInput) -> Result<()> {
-        let existing = self
-            .connection
-            .query_row(
-                "
-                SELECT id
-                FROM misconceptions
-                WHERE concept_id = ?1
-                  AND error_type = ?2
-                  AND description = ?3
-                  AND resolved_at IS NULL
-                ORDER BY last_seen_at DESC
-                LIMIT 1
-                ",
-                params![
-                    misconception.concept_id,
-                    misconception.error_type,
-                    misconception.description
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-
-        if let Some(id) = existing {
-            self.connection.execute(
-                "
-                UPDATE misconceptions
-                SET last_seen_at = datetime('now'),
-                    evidence_count = evidence_count + 1
-                WHERE id = ?1
-                ",
-                params![id],
-            )?;
-        } else {
-            self.connection.execute(
-                "
-                INSERT INTO misconceptions (
-                    id, concept_id, error_type, description, first_seen_at, last_seen_at, resolved_at, evidence_count
-                )
-                VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'), NULL, 1)
-                ",
-                params![
-                    make_record_id("misconception", &misconception.description),
-                    misconception.concept_id,
-                    misconception.error_type,
-                    misconception.description,
-                ],
-            )?;
-        }
-
-        Ok(())
-    }
-
     fn seed_default_concepts(&self) -> Result<()> {
         let concepts = [
             (
@@ -702,6 +630,281 @@ impl AppDatabase {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+struct MisconceptionCandidateRecord {
+    id: String,
+    evidence: Vec<String>,
+    evidence_count: usize,
+    status: String,
+}
+
+fn ensure_concept_state_in(connection: &Connection, concept_id: &str) -> Result<()> {
+    connection.execute(
+        "
+        INSERT INTO concept_state (concept_id)
+        VALUES (?1)
+        ON CONFLICT(concept_id) DO NOTHING
+        ",
+        params![concept_id],
+    )?;
+    Ok(())
+}
+
+fn concept_state_for_in(connection: &Connection, concept_id: &str) -> Result<ConceptStateSnapshot> {
+    connection
+        .query_row(
+            "
+        SELECT mastery_estimate, retrieval_strength, stability_days, ease_factor
+        FROM concept_state
+        WHERE concept_id = ?1
+        ",
+            params![concept_id],
+            |row| {
+                Ok(ConceptStateSnapshot {
+                    mastery_estimate: row.get(0)?,
+                    retrieval_strength: row.get(1)?,
+                    stability_days: row.get(2)?,
+                    ease_factor: row.get(3)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+}
+
+fn update_concept_state_in(connection: &Connection, attempt: &AttemptRecord) -> Result<()> {
+    let current = concept_state_for_in(connection, &attempt.concept_id)?;
+    let transition = concept_state_after_attempt(
+        current,
+        attempt.correctness.as_str(),
+        attempt.reasoning_quality.as_str(),
+    );
+    let success_timestamp = if transition.success {
+        Some("datetime('now')")
+    } else {
+        None
+    };
+    let failure_timestamp = if transition.success {
+        None
+    } else {
+        Some("datetime('now')")
+    };
+
+    connection.execute(
+        &format!(
+            "
+            UPDATE concept_state
+            SET mastery_estimate = ?2,
+                retrieval_strength = ?3,
+                last_seen_at = datetime('now'),
+                last_success_at = {},
+                last_failure_at = {},
+                next_review_at = datetime('now', ?4),
+                stability_days = ?5,
+                ease_factor = ?6
+            WHERE concept_id = ?1
+            ",
+            success_timestamp.unwrap_or("last_success_at"),
+            failure_timestamp.unwrap_or("last_failure_at"),
+        ),
+        params![
+            attempt.concept_id,
+            transition.next_state.mastery_estimate,
+            transition.next_state.retrieval_strength,
+            transition.review_modifier,
+            transition.next_state.stability_days,
+            transition.next_state.ease_factor,
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn stage_misconception_candidate_in(
+    transaction: &Transaction<'_>,
+    attempt_id: &str,
+    misconception: &MisconceptionInput,
+) -> Result<()> {
+    let existing = transaction
+        .query_row(
+            "
+            SELECT id, evidence, evidence_count, status
+            FROM misconception_candidates
+            WHERE concept_id = ?1
+              AND error_type = ?2
+              AND description = ?3
+            ORDER BY last_seen_at DESC
+            LIMIT ?4
+            ",
+            params![
+                misconception.concept_id,
+                misconception.error_type,
+                misconception.description,
+                1_i64
+            ],
+            |row| {
+                let raw_evidence = row.get::<_, String>(1)?;
+                Ok(MisconceptionCandidateRecord {
+                    id: row.get(0)?,
+                    evidence: serde_json::from_str::<Vec<String>>(&raw_evidence)
+                        .unwrap_or_default(),
+                    evidence_count: row.get::<_, i64>(2)? as usize,
+                    status: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+
+    match existing {
+        Some(mut candidate) => {
+            if !candidate.evidence.iter().any(|item| item == attempt_id) {
+                candidate.evidence.push(attempt_id.to_string());
+            }
+            let next_count = candidate.evidence.len().max(candidate.evidence_count);
+            let next_status = if candidate.status == "graduated" {
+                "graduated"
+            } else {
+                "pending"
+            };
+            transaction.execute(
+                "
+                UPDATE misconception_candidates
+                SET evidence = ?2,
+                    evidence_count = ?3,
+                    last_seen_at = datetime('now'),
+                    status = ?4,
+                    rationale = CASE WHEN ?4 = 'pending' THEN '' ELSE rationale END
+                WHERE id = ?1
+                ",
+                params![
+                    candidate.id,
+                    serde_json::to_string(&candidate.evidence)?,
+                    next_count as i64,
+                    next_status,
+                ],
+            )?;
+
+            if candidate.status == "graduated" {
+                sync_graduated_misconception_in(transaction, misconception, next_count)?;
+            } else if next_count >= 3 {
+                graduate_misconception_candidate_in(
+                    transaction,
+                    &candidate.id,
+                    misconception,
+                    next_count,
+                )?;
+            }
+        }
+        None => {
+            transaction.execute(
+                "
+                INSERT INTO misconception_candidates (
+                    id, concept_id, error_type, description, evidence, first_seen_at, last_seen_at, status, rationale, evidence_count
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'), 'pending', '', 1)
+                ",
+                params![
+                    make_record_id("misconception-candidate", &misconception.description),
+                    misconception.concept_id,
+                    misconception.error_type,
+                    misconception.description,
+                    serde_json::to_string(&vec![attempt_id.to_string()])?,
+                ],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn graduate_misconception_candidate_in(
+    transaction: &Transaction<'_>,
+    candidate_id: &str,
+    misconception: &MisconceptionInput,
+    evidence_count: usize,
+) -> Result<()> {
+    let rationale = "auto-threshold after 3 corroborating attempts";
+    transaction.execute(
+        "
+        UPDATE misconception_candidates
+        SET status = 'graduated',
+            rationale = ?2,
+            last_seen_at = datetime('now')
+        WHERE id = ?1
+        ",
+        params![candidate_id, rationale],
+    )?;
+    transaction.execute(
+        "
+        INSERT INTO misconception_decisions (id, candidate_id, decided_at, decided_by, rationale)
+        VALUES (?1, ?2, datetime('now'), 'auto_threshold', ?3)
+        ",
+        params![
+            make_record_id("misconception-decision", candidate_id),
+            candidate_id,
+            rationale,
+        ],
+    )?;
+    sync_graduated_misconception_in(transaction, misconception, evidence_count)?;
+    Ok(())
+}
+
+fn sync_graduated_misconception_in(
+    connection: &Connection,
+    misconception: &MisconceptionInput,
+    evidence_count: usize,
+) -> Result<()> {
+    let existing = connection
+        .query_row(
+            "
+            SELECT id
+            FROM misconceptions
+            WHERE concept_id = ?1
+              AND error_type = ?2
+              AND description = ?3
+              AND resolved_at IS NULL
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+            ",
+            params![
+                misconception.concept_id,
+                misconception.error_type,
+                misconception.description
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+
+    if let Some(id) = existing {
+        connection.execute(
+            "
+            UPDATE misconceptions
+            SET last_seen_at = datetime('now'),
+                evidence_count = ?2
+            WHERE id = ?1
+            ",
+            params![id, evidence_count as i64],
+        )?;
+    } else {
+        connection.execute(
+            "
+            INSERT INTO misconceptions (
+                id, concept_id, error_type, description, first_seen_at, last_seen_at, resolved_at, evidence_count
+            )
+            VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'), NULL, ?5)
+            ",
+            params![
+                make_record_id("misconception", &misconception.description),
+                misconception.concept_id,
+                misconception.error_type,
+                misconception.description,
+                evidence_count as i64,
+            ],
+        )?;
+    }
+
+    Ok(())
 }
 
 fn concept_state_after_attempt(
@@ -879,6 +1082,9 @@ mod tests {
             let reviews = database
                 .list_due_reviews(5)
                 .unwrap_or_else(|err| panic!("due review query failed: {err}"));
+            let repair_signals = database
+                .list_recent_repair_signals(5)
+                .unwrap_or_else(|err| panic!("repair signal query failed: {err}"));
             let misconceptions = database
                 .list_recent_misconceptions(5)
                 .unwrap_or_else(|err| panic!("misconception query failed: {err}"));
@@ -890,11 +1096,9 @@ mod tests {
             assert_eq!(stats.total_sessions, 1);
             assert!(!reviews.is_empty());
             assert_eq!(reviews[0].concept_id, "matrix_multiplication_dims");
-            assert_eq!(misconceptions.len(), 1);
-            assert_eq!(
-                misconceptions[0].error_type,
-                "conceptual_misunderstanding".to_string()
-            );
+            assert_eq!(repair_signals.len(), 1);
+            assert_eq!(repair_signals[0].status, "candidate".to_string());
+            assert_eq!(misconceptions.len(), 0);
         }
 
         let _ = fs::remove_dir_all(dir);
@@ -945,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_identical_misconception_does_not_duplicate() {
+    fn repeated_identical_misconception_stays_candidate_until_threshold() {
         let dir = temp_db_dir();
         let path = dir.join("studyos.db");
         let database =
@@ -982,11 +1186,78 @@ mod tests {
                 .unwrap_or_else(|err| panic!("attempt record failed: {err}"));
         }
 
+        let repair_signals = database
+            .list_recent_repair_signals(5)
+            .unwrap_or_else(|err| panic!("repair signal query failed: {err}"));
         let misconceptions = database
             .list_recent_misconceptions(5)
             .unwrap_or_else(|err| panic!("misconception query failed: {err}"));
+
+        assert_eq!(repair_signals.len(), 1);
+        assert_eq!(repair_signals[0].status, "candidate".to_string());
+        assert_eq!(repair_signals[0].evidence_count, 2);
+        assert_eq!(misconceptions.len(), 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn repeated_identical_misconception_graduates_after_threshold() {
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        let database =
+            AppDatabase::open(&path).unwrap_or_else(|err| panic!("database open failed: {err}"));
+        database
+            .start_session(&SessionRecord {
+                id: "session-1".to_string(),
+                planned_minutes: 30,
+                mode: "Study".to_string(),
+            })
+            .unwrap_or_else(|err| panic!("session start failed: {err}"));
+
+        for index in 0..3 {
+            database
+                .record_attempt(
+                    &AttemptRecord {
+                        id: format!("attempt-{index}"),
+                        session_id: "session-1".to_string(),
+                        concept_id: "matrix_multiplication_dims".to_string(),
+                        question_type: "retrieval_response".to_string(),
+                        prompt_hash: format!("hash-{index}"),
+                        student_answer: "wrong".to_string(),
+                        correctness: "incorrect".to_string(),
+                        latency_ms: 500,
+                        reasoning_quality: "missing".to_string(),
+                        feedback_summary: "Still confused.".to_string(),
+                    },
+                    Some(&MisconceptionInput {
+                        concept_id: "matrix_multiplication_dims".to_string(),
+                        error_type: "conceptual_misunderstanding".to_string(),
+                        description: "Confused inner and outer dimensions.".to_string(),
+                    }),
+                )
+                .unwrap_or_else(|err| panic!("attempt record failed: {err}"));
+        }
+
+        let repair_signals = database
+            .list_recent_repair_signals(5)
+            .unwrap_or_else(|err| panic!("repair signal query failed: {err}"));
+        let misconceptions = database
+            .list_recent_misconceptions(5)
+            .unwrap_or_else(|err| panic!("misconception query failed: {err}"));
+        let decision_count = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM misconception_decisions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_or_else(|err| panic!("decision count failed: {err}"));
+
+        assert_eq!(repair_signals.len(), 1);
+        assert_eq!(repair_signals[0].status, "confirmed".to_string());
+        assert_eq!(repair_signals[0].evidence_count, 3);
         assert_eq!(misconceptions.len(), 1);
-        assert_eq!(misconceptions[0].evidence_count, 2);
+        assert_eq!(misconceptions[0].evidence_count, 3);
+        assert_eq!(decision_count, 1);
 
         let _ = fs::remove_dir_all(dir);
     }

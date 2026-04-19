@@ -96,7 +96,7 @@ fn run_interactive(paths: &AppPaths, log_json_path: Option<PathBuf>) -> Result<(
             })
             .collect(),
         recent_misconceptions: database
-            .list_recent_misconceptions(4)?
+            .list_recent_repair_signals(4)?
             .into_iter()
             .map(|item| StartupMisconceptionItem {
                 concept_name: item.concept_name,
@@ -190,7 +190,7 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
             })
             .collect(),
         recent_misconceptions: database
-            .list_recent_misconceptions(4)?
+            .list_recent_repair_signals(4)?
             .into_iter()
             .map(|item| StartupMisconceptionItem {
                 concept_name: item.concept_name,

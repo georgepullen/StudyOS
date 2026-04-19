@@ -574,20 +574,20 @@ impl App {
     }
 
     pub fn misconceptions_summary(&self) -> Vec<String> {
-        match self.database.list_recent_misconceptions(4) {
+        match self.database.list_recent_repair_signals(4) {
             Ok(entries) if !entries.is_empty() => {
-                let mut lines = vec!["Recent recurring misconceptions:".to_string()];
+                let mut lines = vec!["Recent repair signals:".to_string()];
                 for entry in entries {
                     lines.push(format!(
-                        "• {} [{}] x{}",
-                        entry.concept_name, entry.error_type, entry.evidence_count
+                        "• {} [{} | {}] x{}",
+                        entry.concept_name, entry.error_type, entry.status, entry.evidence_count
                     ));
                     lines.push(format!("  {}", entry.description));
                 }
                 lines
             }
             Ok(_) => vec![
-                "No misconception history yet; repeated errors will accumulate here.".to_string(),
+                "No repair signals yet; repeated evidence will accumulate here before confirmed misconceptions are promoted.".to_string(),
             ],
             Err(error) => vec![format!("Misconception summary unavailable: {error}")],
         }
@@ -674,7 +674,7 @@ impl App {
     fn fallback_session_recap(&self) -> SessionRecapSummary {
         let mut weak_concepts = self
             .database
-            .list_recent_misconceptions(3)
+            .list_recent_repair_signals(3)
             .unwrap_or_default()
             .into_iter()
             .map(|item| item.concept_name)
@@ -922,10 +922,15 @@ impl App {
             .join(", ");
         let misconceptions = self
             .database
-            .list_recent_misconceptions(3)
+            .list_recent_repair_signals(3)
             .unwrap_or_default()
             .into_iter()
-            .map(|item| format!("{}: {}", item.concept_name, item.description))
+            .map(|item| {
+                format!(
+                    "{} [{}]: {}",
+                    item.concept_name, item.status, item.description
+                )
+            })
             .collect::<Vec<_>>()
             .join("; ");
         let material_terms = self
@@ -936,7 +941,7 @@ impl App {
             .map(|review| review.concept_name)
             .chain(
                 self.database
-                    .list_recent_misconceptions(3)
+                    .list_recent_repair_signals(3)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|item| item.concept_name),
@@ -1076,13 +1081,13 @@ impl App {
             .join("; ");
         let misconceptions = self
             .database
-            .list_recent_misconceptions(4)
+            .list_recent_repair_signals(4)
             .unwrap_or_default()
             .into_iter()
             .map(|item| {
                 format!(
-                    "{} [{}]: {}",
-                    item.concept_name, item.error_type, item.description
+                    "{} [{} | {}]: {}",
+                    item.concept_name, item.error_type, item.status, item.description
                 )
             })
             .collect::<Vec<_>>()
@@ -2729,15 +2734,21 @@ mod tests {
             .database
             .stats()
             .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let repair_signals = app
+            .database
+            .list_recent_repair_signals(5)
+            .unwrap_or_else(|err| panic!("repair signal query failed: {err}"));
         let misconceptions = app
             .database
             .list_recent_misconceptions(5)
             .unwrap_or_else(|err| panic!("misconception query failed: {err}"));
 
         assert_eq!(stats.total_attempts, 1);
-        assert_eq!(misconceptions.len(), 1);
+        assert_eq!(repair_signals.len(), 1);
+        assert_eq!(repair_signals[0].status, "candidate".to_string());
+        assert_eq!(misconceptions.len(), 0);
         assert_eq!(
-            misconceptions[0].error_type,
+            repair_signals[0].error_type,
             "conceptual_misunderstanding".to_string()
         );
 

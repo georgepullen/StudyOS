@@ -17,6 +17,10 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::protocol::{
+    InitializeParams, ThreadStartParams, TurnStartParams, jsonrpc_notification, jsonrpc_request,
+};
+
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 const RUNTIME_LOG_CAPACITY: usize = 50;
 const SERVER_REQUEST_REJECTION: &str =
@@ -170,7 +174,10 @@ impl CodexAppServerTransport {
         }))
     }
 
-    fn send_request(&self, method: &str, params: Value) -> Result<Value> {
+    fn send_request<T>(&self, method: &'static str, params: T) -> Result<Value>
+    where
+        T: Serialize,
+    {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         self.pending
@@ -178,12 +185,7 @@ impl CodexAppServerTransport {
             .map_err(|_| anyhow!("pending request lock poisoned"))?
             .insert(id, tx);
 
-        let message = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
+        let message = serde_json::to_value(jsonrpc_request(id, method, params))?;
         self.write_message(&message)?;
 
         match rx.recv_timeout(RPC_TIMEOUT) {
@@ -198,20 +200,11 @@ impl CodexAppServerTransport {
         }
     }
 
-    fn send_notification(&self, method: &str, params: Value) -> Result<()> {
-        let message = if params.is_null() {
-            json!({
-                "jsonrpc": "2.0",
-                "method": method,
-            })
-        } else {
-            json!({
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": params,
-            })
-        };
-
+    fn send_notification<T>(&self, method: &'static str, params: Option<T>) -> Result<()>
+    where
+        T: Serialize,
+    {
+        let message = serde_json::to_value(jsonrpc_notification(method, params))?;
         self.write_message(&message)
     }
 
@@ -228,30 +221,16 @@ impl CodexAppServerTransport {
 
 impl AppServerTransport for CodexAppServerTransport {
     fn initialize(&self) -> Result<()> {
-        let params = json!({
-            "clientInfo": {
-                "name": "studyos",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-            "capabilities": {
-                "experimentalApi": true
-            }
-        });
-
-        let _ = self.send_request("initialize", params)?;
-        self.send_notification("initialized", Value::Null)?;
+        let _ = self.send_request("initialize", InitializeParams::studyos_default())?;
+        self.send_notification::<Value>("initialized", None)?;
         Ok(())
     }
 
     fn start_thread(&self, cwd: &Path, developer_instructions: &str) -> Result<String> {
-        let params = json!({
-            "cwd": cwd.display().to_string(),
-            "approvalPolicy": "never",
-            "sandbox": "workspace-write",
-            "developerInstructions": developer_instructions,
-        });
-
-        let result = self.send_request("thread/start", params)?;
+        let result = self.send_request(
+            "thread/start",
+            ThreadStartParams::for_start(cwd, developer_instructions),
+        )?;
         result
             .get("thread")
             .and_then(|thread| thread.get("id"))
@@ -261,14 +240,10 @@ impl AppServerTransport for CodexAppServerTransport {
     }
 
     fn resume_thread(&self, thread_id: &str, cwd: &Path) -> Result<String> {
-        let params = json!({
-            "threadId": thread_id,
-            "cwd": cwd.display().to_string(),
-            "approvalPolicy": "never",
-            "sandbox": "workspace-write",
-        });
-
-        let result = self.send_request("thread/resume", params)?;
+        let result = self.send_request(
+            "thread/resume",
+            ThreadStartParams::for_resume(thread_id, cwd),
+        )?;
         result
             .get("thread")
             .and_then(|thread| thread.get("id"))
@@ -284,26 +259,10 @@ impl AppServerTransport for CodexAppServerTransport {
         output_schema: Value,
         cwd: &Path,
     ) -> Result<String> {
-        let params = json!({
-            "threadId": thread_id,
-            "cwd": cwd.display().to_string(),
-            "sandboxPolicy": {
-                "type": "workspaceWrite",
-                "networkAccess": true,
-                "excludeTmpdirEnvVar": false,
-                "writableRoots": []
-            },
-            "input": [
-                {
-                    "type": "text",
-                    "text": prompt,
-                    "text_elements": [],
-                }
-            ],
-            "outputSchema": output_schema,
-        });
-
-        let result = self.send_request("turn/start", params)?;
+        let result = self.send_request(
+            "turn/start",
+            TurnStartParams::structured_prompt(thread_id, prompt, output_schema, cwd),
+        )?;
         result
             .get("turn")
             .and_then(|turn| turn.get("id"))
@@ -542,29 +501,16 @@ pub fn capture_runtime_fixture(
         &mut stdin,
         1,
         "initialize",
-        json!({
-            "clientInfo": {
-                "name": "studyos",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-            "capabilities": {
-                "experimentalApi": true
-            }
-        }),
+        InitializeParams::studyos_default(),
     )?;
     raw_lines.push(read_rpc_line(&mut reader)?);
-    write_rpc_notification(&mut stdin, "initialized", Value::Null)?;
+    write_rpc_notification::<Value>(&mut stdin, "initialized", None)?;
 
     write_rpc_request(
         &mut stdin,
         2,
         "thread/start",
-        json!({
-            "cwd": cwd.display().to_string(),
-            "approvalPolicy": "never",
-            "sandbox": "workspace-write",
-            "developerInstructions": developer_instructions,
-        }),
+        ThreadStartParams::for_start(cwd, developer_instructions),
     )?;
     let mut thread_id = None;
     while thread_id.is_none() {
@@ -585,24 +531,7 @@ pub fn capture_runtime_fixture(
         &mut stdin,
         3,
         "turn/start",
-        json!({
-            "threadId": thread_id,
-            "cwd": cwd.display().to_string(),
-            "sandboxPolicy": {
-                "type": "workspaceWrite",
-                "networkAccess": true,
-                "excludeTmpdirEnvVar": false,
-                "writableRoots": []
-            },
-            "input": [
-                {
-                    "type": "text",
-                    "text": opening_prompt,
-                    "text_elements": [],
-                }
-            ],
-            "outputSchema": output_schema,
-        }),
+        TurnStartParams::structured_prompt(&thread_id, opening_prompt, output_schema, cwd),
     )?;
 
     let mut turn_id = None;
@@ -782,12 +711,14 @@ fn spawn_stderr_reader(
                         }),
                     );
                     push_runtime_log(&runtime_log, line.clone());
-                    push_event(
-                        &events,
-                        RuntimeEvent::Error {
-                            message: format!("app-server stderr: {line}"),
-                        },
-                    );
+                    if stderr_line_is_error(&line) {
+                        push_event(
+                            &events,
+                            RuntimeEvent::Error {
+                                message: format!("app-server stderr: {line}"),
+                            },
+                        );
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -809,6 +740,15 @@ fn spawn_stderr_reader(
             }
         }
     });
+}
+
+fn stderr_line_is_error(line: &str) -> bool {
+    let lowered = line.to_ascii_lowercase();
+    lowered.contains(" error")
+        || lowered.starts_with("error")
+        || lowered.contains("panic")
+        || lowered.contains("failed")
+        || lowered.contains("fatal")
 }
 
 fn open_event_log(path: Option<PathBuf>) -> Result<EventLog> {
@@ -997,31 +937,30 @@ fn push_runtime_log(runtime_log: &RuntimeLog, line: String) {
     }
 }
 
-fn write_rpc_request(stdin: &mut ChildStdin, id: u64, method: &str, params: Value) -> Result<()> {
-    let message = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    });
+fn write_rpc_request<T>(
+    stdin: &mut ChildStdin,
+    id: u64,
+    method: &'static str,
+    params: T,
+) -> Result<()>
+where
+    T: Serialize,
+{
+    let message = serde_json::to_value(jsonrpc_request(id, method, params))?;
     writeln!(stdin, "{message}")?;
     stdin.flush()?;
     Ok(())
 }
 
-fn write_rpc_notification(stdin: &mut ChildStdin, method: &str, params: Value) -> Result<()> {
-    let message = if params.is_null() {
-        json!({
-            "jsonrpc": "2.0",
-            "method": method,
-        })
-    } else {
-        json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        })
-    };
+fn write_rpc_notification<T>(
+    stdin: &mut ChildStdin,
+    method: &'static str,
+    params: Option<T>,
+) -> Result<()>
+where
+    T: Serialize,
+{
+    let message = serde_json::to_value(jsonrpc_notification(method, params))?;
     writeln!(stdin, "{message}")?;
     stdin.flush()?;
     Ok(())
@@ -1039,7 +978,7 @@ fn read_rpc_line(reader: &mut BufReader<std::process::ChildStdout>) -> Result<St
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedServerMessage, RuntimeEvent, parse_server_message};
+    use super::{ParsedServerMessage, RuntimeEvent, parse_server_message, stderr_line_is_error};
 
     #[test]
     fn parse_notification_line_maps_into_runtime_event() {
@@ -1053,5 +992,13 @@ mod tests {
             }
             other => panic!("unexpected parsed message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn stderr_classification_is_not_triggered_by_info_lines() {
+        assert!(!stderr_line_is_error("INFO studyos runtime ready"));
+        assert!(!stderr_line_is_error("DEBUG request completed"));
+        assert!(stderr_line_is_error("ERROR transport failed"));
+        assert!(stderr_line_is_error("panic: unexpected state"));
     }
 }

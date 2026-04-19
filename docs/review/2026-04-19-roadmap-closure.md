@@ -1,9 +1,9 @@
-# StudyOS Roadmap Closure
+# StudyOS Roadmap Execution Status
 
 Date: 2026-04-19
 Roadmap source: [2026-04-19-reviewer-response-and-roadmap.md](/Users/georgepullen/Documents/StudyOS/docs/review/2026-04-19-reviewer-response-and-roadmap.md)
 
-This note records the state of the repo after executing the roadmap end-to-end rather than narrating intent.
+This note records the state of the repo after a full roadmap implementation pass and subsequent reviewer-led hardening. It is intentionally narrower than a blanket claim of "closure."
 
 ## Outcome
 
@@ -27,7 +27,7 @@ The repo is no longer in the state described by the reviewer response. The origi
 
 ### Phase 0
 
-Completed.
+Substantially completed.
 
 Evidence:
 
@@ -38,7 +38,7 @@ Evidence:
 
 ### Phase 1
 
-Completed.
+Substantially completed.
 
 Evidence:
 
@@ -50,7 +50,7 @@ Evidence:
 
 ### Phase 2
 
-Completed.
+Substantially completed.
 
 Evidence:
 
@@ -65,7 +65,7 @@ Evidence:
 
 ### Phase 3
 
-Completed.
+Substantially completed.
 
 Evidence:
 
@@ -75,7 +75,7 @@ Evidence:
 
 ### Phase 4
 
-Completed.
+Substantially completed.
 
 Evidence:
 
@@ -86,7 +86,7 @@ Evidence:
 
 ### Phase 5
 
-Completed.
+Substantially completed.
 
 Evidence:
 
@@ -128,4 +128,4 @@ Against the roadmap’s own bar, the project has crossed out of proof-of-concept
 6. clippy is clean under `-D warnings`
 7. reviewer-facing live-run artefacts now exist under [docs/review/run-logs](/Users/georgepullen/Documents/StudyOS/docs/review/run-logs)
 
-The remaining work is no longer “make the harness real.” It is product refinement on top of a functioning harness.
+The remaining work is no longer "make the harness real." It is refinement, extension, and reviewer-driven tightening on top of a functioning harness. Earlier versions of this note overstated that as full closure; the more accurate description is that the core harness is now real, tested, and materially harder to regress.
