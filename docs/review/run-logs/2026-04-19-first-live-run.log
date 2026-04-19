@@ -1,0 +1,43 @@
+# StudyOS First Live Runtime Proof
+
+Date: 2026-04-19
+
+## Commands
+
+```bash
+STUDYOS_CODEX_AVAILABLE=1 cargo test -p studyos-cli --test runtime_live -- --ignored --nocapture
+cargo run -p studyos-cli --example record_runtime_session
+```
+
+## Live runtime smoke test
+
+```text
+running 2 tests
+test runtime_live_reaches_first_question ... ok
+test runtime_live_completes_submission_round_trip ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.37s
+```
+
+What this proves:
+
+- StudyOS can spawn a real local `codex app-server`.
+- The opening turn reaches a tutor-generated structured question.
+- A structured submission can be sent back through the live runtime.
+- The graded response is parsed and persisted to SQLite as attempt evidence.
+
+## Recorded runtime fixture
+
+```text
+Recorded runtime fixture at /Users/georgepullen/Documents/StudyOS/crates/studyos-cli/tests/fixtures/runtime/opening-turn.jsonl
+```
+
+Fixture details at capture time:
+
+```text
+total 168
+-rw-r--r--  opening-turn.jsonl      82171 bytes
+-rw-r--r--  opening-turn.stderr.log     0 bytes
+```
+
+The committed fixture is used by `tests/runtime_replay.rs` to prove the parser and structured rendering path without requiring live model access on every test run.

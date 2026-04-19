@@ -1,0 +1,103 @@
+# StudyOS Validation Log
+
+Date: 2026-04-19
+Repo state: local working tree after roadmap-completion pass
+
+## Commands
+
+```bash
+./scripts/check.sh
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+STUDYOS_DATA_DIR=$(mktemp -d) cargo run -p studyos-cli -- doctor
+cargo run -p studyos-cli -- tour
+```
+
+## Result Summary
+
+- `./scripts/check.sh`: passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `cargo test --workspace`: passed
+- `doctor`: passed on a clean temporary data directory
+- `tour`: passed and printed the onboarding flow
+
+## `cargo test --workspace`
+
+Highlights from the successful run:
+
+```text
+running 12 tests
+test app::tests::resume_state_round_trips_per_widget_variant ... ok
+test app::tests::structured_matrix_question_uses_declared_dimensions ... ok
+test app::tests::quit_review_opens_before_exit_and_can_be_cancelled ... ok
+test app::tests::recap_ready_event_does_not_block_key_handler ... ok
+test app::tests::opening_prompt_includes_relevant_local_materials ... ok
+test runtime::tests::parse_notification_line_maps_into_runtime_event ... ok
+test app::tests::ctrl_r_reconnects_runtime_after_disconnect ... ok
+test app::tests::disconnect_persists_resume_and_blocks_submission ... ok
+test app::tests::structured_payload_persists_attempt_evidence ... ok
+test app::tests::mismatched_runtime_turn_id_still_persists_structured_payload ... ok
+test app::tests::working_answer_widget_switches_between_fields ... ok
+test app::tests::widget_draft_survives_restart ... ok
+...
+test runtime_replay_reaches_first_question_without_parse_warning ... ok
+test tour_command_mentions_materials_and_runtime_trace ... ok
+...
+test store::tests::mastery_retrieval_and_ease_stay_in_range ... ok
+
+test result: ok. 44 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+```
+
+The two ignored tests are the live `codex app-server` integration tests, which are run separately below.
+
+## `doctor` output
+
+```text
+StudyOS doctor
+data_dir: /var/folders/wx/ffbxxvys6bncv7_cfkp74cpw0000gn/T/tmp.WzWrDY7sGx
+logs_dir: /var/folders/wx/ffbxxvys6bncv7_cfkp74cpw0000gn/T/tmp.WzWrDY7sGx/logs
+config_path: /var/folders/wx/ffbxxvys6bncv7_cfkp74cpw0000gn/T/tmp.WzWrDY7sGx/config.toml (missing)
+database_path: /var/folders/wx/ffbxxvys6bncv7_cfkp74cpw0000gn/T/tmp.WzWrDY7sGx/studyos.db (present)
+deadlines_path: /var/folders/wx/ffbxxvys6bncv7_cfkp74cpw0000gn/T/tmp.WzWrDY7sGx/deadlines.json (missing)
+timetable_path: /var/folders/wx/ffbxxvys6bncv7_cfkp74cpw0000gn/T/tmp.WzWrDY7sGx/timetable.json (missing)
+default_course: Matrix Algebra & Linear Models
+strictness: Standard
+suggested_mode: Study
+mode_why_now: You have a 90-minute evening block window starting at 13:18; adapt the session to fit that constraint. No urgent repair queue yet, so this session should establish or extend fluent understanding with retrieval-first warmups.
+study_window: 90m EveningBlock @ 2026-04-19T13:18:20.878429+01:00
+sessions_logged: 0
+attempts_logged: 0
+due_reviews: 0
+loaded_deadlines: 0
+loaded_materials: 0
+loaded_courses: 0
+materials_ingested: 0
+materials_last_run: never
+materials_raw_git_safe: warning
+resume_state_present: false
+app_server: available (initialize=true)
+```
+
+## `tour` output
+
+```text
+StudyOS tour
+1. Initialize local data once:
+   cargo run -p studyos-cli -- init
+2. Check local health and runtime wiring:
+   cargo run -p studyos-cli -- doctor
+3. Drop your course files into:
+   /Users/georgepullen/Documents/StudyOS/.studyos/materials/raw
+4. Build the distilled materials index:
+   cargo run -p studyos-cli -- materials ingest
+5. Add the next exam or coursework deadline:
+   cargo run -p studyos-cli -- deadlines add --title "Linear models exam" --due 2026-05-12T09:00:00+01:00 --course "Matrix Algebra & Linear Models"
+6. Add upcoming timetable slots:
+   cargo run -p studyos-cli -- timetable add --day Mon --start 15:00 --end 17:00 --course "Matrix Algebra & Linear Models" --title "Lecture"
+7. Start a study session:
+   cargo run -p studyos-cli
+8. During a session use:
+   F5 submit answer, q review-and-quit, Ctrl+R reconnect runtime, ? help
+9. Optional runtime trace:
+   cargo run -p studyos-cli -- --log-json
+```
