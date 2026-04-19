@@ -85,18 +85,20 @@ fn run_interactive(paths: &AppPaths, log_json_path: Option<PathBuf>) -> Result<(
     let database = AppDatabase::open(&paths.database_path)?;
     let local_context = LocalContext::load(paths)?;
     let mut stats = database.stats()?;
-    stats.upcoming_deadlines = local_context.upcoming_deadline_count();
+    stats.due_reviews = database.due_review_count_for_course(&config.default_course)?;
+    stats.upcoming_deadlines =
+        local_context.upcoming_deadline_count_for_course(&config.default_course);
     let resume_state = database.load_resume_state()?;
     let startup_context = BootstrapStudyContext {
         due_reviews: database
-            .list_due_reviews(4)?
+            .list_due_reviews_for_course(&config.default_course, 4)?
             .into_iter()
             .map(|item| StartupReviewItem {
                 concept_name: item.concept_name,
             })
             .collect(),
         recent_misconceptions: database
-            .list_recent_repair_signals(4)?
+            .list_recent_repair_signals_for_course(&config.default_course, 4)?
             .into_iter()
             .map(|item| StartupMisconceptionItem {
                 concept_name: item.concept_name,
@@ -104,8 +106,8 @@ fn run_interactive(paths: &AppPaths, log_json_path: Option<PathBuf>) -> Result<(
                 description: item.description,
             })
             .collect(),
-        last_session_recap: database.latest_session_recap()?,
-        study_window: local_context.best_study_window(),
+        last_session_recap: database.latest_session_recap(&config.default_course)?,
+        study_window: local_context.best_study_window_for_course(&config.default_course),
     };
     let snapshot = AppSnapshot::bootstrap(&config, &stats, &startup_context);
     let resolved_log_path = resolve_log_json_path(paths, log_json_path);
@@ -179,18 +181,20 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
     let local_context = LocalContext::load(paths)?;
     let materials_status = load_material_ingestion_status(paths)?;
     let mut stats = database.stats()?;
-    stats.upcoming_deadlines = local_context.upcoming_deadline_count();
+    stats.due_reviews = database.due_review_count_for_course(&config.default_course)?;
+    stats.upcoming_deadlines =
+        local_context.upcoming_deadline_count_for_course(&config.default_course);
     let resume = database.load_resume_state()?;
     let startup_context = BootstrapStudyContext {
         due_reviews: database
-            .list_due_reviews(4)?
+            .list_due_reviews_for_course(&config.default_course, 4)?
             .into_iter()
             .map(|item| StartupReviewItem {
                 concept_name: item.concept_name,
             })
             .collect(),
         recent_misconceptions: database
-            .list_recent_repair_signals(4)?
+            .list_recent_repair_signals_for_course(&config.default_course, 4)?
             .into_iter()
             .map(|item| StartupMisconceptionItem {
                 concept_name: item.concept_name,
@@ -198,8 +202,8 @@ fn run_doctor(paths: &AppPaths) -> Result<()> {
                 description: item.description,
             })
             .collect(),
-        last_session_recap: database.latest_session_recap()?,
-        study_window: local_context.best_study_window(),
+        last_session_recap: database.latest_session_recap(&config.default_course)?,
+        study_window: local_context.best_study_window_for_course(&config.default_course),
     };
     let snapshot = AppSnapshot::bootstrap(&config, &stats, &startup_context);
     let app_server = match CodexAppServerTransport::spawn() {

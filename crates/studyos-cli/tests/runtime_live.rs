@@ -29,15 +29,15 @@ fn runtime_live_reaches_first_question() {
     let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         app.poll_runtime();
-        if app_has_question(&app) {
+        if app_has_question(&app) && app.active_widget().is_some() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
     assert!(
-        app_has_question(&app),
-        "live runtime never produced a question card"
+        app_has_question(&app) && app.active_widget().is_some(),
+        "live runtime never produced a ready question widget"
     );
     assert!(
         !app_has_parse_warning(&app),
@@ -64,15 +64,15 @@ fn runtime_live_completes_submission_round_trip() {
     let first_deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < first_deadline {
         app.poll_runtime();
-        if app_has_question(&app) {
+        if app_has_question(&app) && app.active_widget().is_some() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
     assert!(
-        app_has_question(&app),
-        "live runtime never produced an initial question card"
+        app_has_question(&app) && app.active_widget().is_some(),
+        "live runtime never produced an initial ready question widget"
     );
 
     fill_active_widget(&mut app);

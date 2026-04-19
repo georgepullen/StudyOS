@@ -106,6 +106,19 @@ impl LocalContext {
             .count()
     }
 
+    pub fn upcoming_deadline_count_for_course(&self, course: &str) -> usize {
+        let horizon = OffsetDateTime::now_utc() + Duration::days(14);
+        self.deadlines
+            .iter()
+            .filter(|deadline| deadline.course.eq_ignore_ascii_case(course))
+            .filter(|deadline| {
+                OffsetDateTime::parse(&deadline.due_at, &Rfc3339)
+                    .map(|due_at| due_at <= horizon)
+                    .unwrap_or(true)
+            })
+            .count()
+    }
+
     pub fn search_materials(
         &self,
         course_filter: Option<&str>,
@@ -206,6 +219,11 @@ impl LocalContext {
         self.best_study_window_at(now)
     }
 
+    pub fn best_study_window_for_course(&self, course: &str) -> Option<StudyWindow> {
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        self.best_study_window_for_course_at(course, now)
+    }
+
     pub fn best_study_window_at(&self, now: OffsetDateTime) -> Option<StudyWindow> {
         if let Some(window) = self.timetable_gap_window(now) {
             return Some(window);
@@ -214,6 +232,29 @@ impl LocalContext {
         let local_hour = now.hour();
         let duration_minutes = if local_hour >= 20 { 60 } else { 90 };
         let source = if self.has_deadline_within_hours(now, 48) {
+            WindowSource::BeforeDeadline
+        } else {
+            WindowSource::EveningBlock
+        };
+        Some(StudyWindow {
+            start: now.format(&Rfc3339).unwrap_or_else(|_| now.to_string()),
+            duration_minutes,
+            source,
+        })
+    }
+
+    pub fn best_study_window_for_course_at(
+        &self,
+        course: &str,
+        now: OffsetDateTime,
+    ) -> Option<StudyWindow> {
+        if let Some(window) = self.timetable_gap_window_for_course(course, now) {
+            return Some(window);
+        }
+
+        let local_hour = now.hour();
+        let duration_minutes = if local_hour >= 20 { 60 } else { 90 };
+        let source = if self.has_deadline_within_hours_for_course(course, now, 48) {
             WindowSource::BeforeDeadline
         } else {
             WindowSource::EveningBlock
@@ -254,6 +295,39 @@ impl LocalContext {
         None
     }
 
+    fn timetable_gap_window_for_course(
+        &self,
+        course: &str,
+        now: OffsetDateTime,
+    ) -> Option<StudyWindow> {
+        let timetable = self.timetable.as_ref()?;
+        for slot in timetable.slots_for_weekday(now.weekday()) {
+            let start_minutes = parse_clock_minutes(&slot.start)?;
+            let now_minutes = (now.hour() as u16) * 60 + now.minute() as u16;
+            if start_minutes <= now_minutes {
+                continue;
+            }
+
+            let gap_minutes = start_minutes.saturating_sub(now_minutes);
+            if gap_minutes < 10 {
+                continue;
+            }
+
+            let source = if self.has_deadline_within_hours_for_course(course, now, 48) {
+                WindowSource::BeforeDeadline
+            } else {
+                WindowSource::TimetableGap
+            };
+            return Some(StudyWindow {
+                start: now.format(&Rfc3339).unwrap_or_else(|_| now.to_string()),
+                duration_minutes: gap_minutes.min(120),
+                source,
+            });
+        }
+
+        None
+    }
+
     fn has_deadline_within_hours(&self, now: OffsetDateTime, hours: i64) -> bool {
         let horizon = now + Duration::hours(hours);
         self.deadlines.iter().any(|deadline| {
@@ -261,6 +335,23 @@ impl LocalContext {
                 .map(|due_at| due_at >= now && due_at <= horizon)
                 .unwrap_or(false)
         })
+    }
+
+    fn has_deadline_within_hours_for_course(
+        &self,
+        course: &str,
+        now: OffsetDateTime,
+        hours: i64,
+    ) -> bool {
+        let horizon = now + Duration::hours(hours);
+        self.deadlines
+            .iter()
+            .filter(|deadline| deadline.course.eq_ignore_ascii_case(course))
+            .any(|deadline| {
+                OffsetDateTime::parse(&deadline.due_at, &Rfc3339)
+                    .map(|due_at| due_at >= now && due_at <= horizon)
+                    .unwrap_or(false)
+            })
     }
 }
 
@@ -814,6 +905,14 @@ mod tests {
         };
 
         assert_eq!(context.upcoming_deadline_count(), 1);
+        assert_eq!(
+            context.upcoming_deadline_count_for_course("Matrix Algebra & Linear Models"),
+            1
+        );
+        assert_eq!(
+            context.upcoming_deadline_count_for_course("Probability & Statistics for Scientists"),
+            0
+        );
     }
 
     #[test]

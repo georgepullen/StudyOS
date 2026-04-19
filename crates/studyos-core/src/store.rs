@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::SessionRecapSummary;
 
-const LATEST_SCHEMA_VERSION: i64 = 3;
+const LATEST_SCHEMA_VERSION: i64 = 5;
 const META_SCHEMA_VERSION_KEY: &str = "schema_version";
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -21,6 +21,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         3,
         include_str!("../migrations/0003_misconception_candidates.sql"),
+    ),
+    (
+        4,
+        include_str!("../migrations/0004_course_runtime_threads.sql"),
+    ),
+    (
+        5,
+        include_str!("../migrations/0005_session_course_scope.sql"),
     ),
 ];
 
@@ -36,6 +44,7 @@ pub struct AppStats {
 pub struct ResumeStateRecord {
     pub session_id: String,
     pub runtime_thread_id: Option<String>,
+    pub active_course: String,
     pub active_mode: String,
     pub active_question_id: Option<String>,
     pub focused_panel: String,
@@ -48,6 +57,7 @@ pub struct SessionRecord {
     pub id: String,
     pub planned_minutes: u16,
     pub mode: String,
+    pub course: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,12 +163,27 @@ impl AppDatabase {
         })
     }
 
+    pub fn due_review_count_for_course(&self, course: &str) -> Result<usize> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT COUNT(*)
+            FROM concept_state
+            INNER JOIN concepts ON concepts.id = concept_state.concept_id
+            WHERE concept_state.next_review_at IS NOT NULL
+              AND concept_state.next_review_at <= datetime('now')
+              AND concepts.course = ?1
+            ",
+        )?;
+        let count = statement.query_row(params![course], |row| row.get::<_, i64>(0))?;
+        Ok(count as usize)
+    }
+
     pub fn load_resume_state(&self) -> Result<Option<ResumeStateRecord>> {
         let record = self
             .connection
             .query_row(
                 "
-                SELECT session_id, runtime_thread_id, active_mode, active_question_id, focused_panel, draft_payload, scratchpad_text
+                SELECT session_id, runtime_thread_id, active_course, active_mode, active_question_id, focused_panel, draft_payload, scratchpad_text
                 FROM resume_state
                 ORDER BY saved_at DESC
                 LIMIT 1
@@ -168,11 +193,12 @@ impl AppDatabase {
                     Ok(ResumeStateRecord {
                         session_id: row.get(0)?,
                         runtime_thread_id: row.get(1)?,
-                        active_mode: row.get(2)?,
-                        active_question_id: row.get(3)?,
-                        focused_panel: row.get(4)?,
-                        draft_payload: row.get(5)?,
-                        scratchpad_text: row.get(6)?,
+                        active_course: row.get(2)?,
+                        active_mode: row.get(3)?,
+                        active_question_id: row.get(4)?,
+                        focused_panel: row.get(5)?,
+                        draft_payload: row.get(6)?,
+                        scratchpad_text: row.get(7)?,
                     })
                 },
             )
@@ -185,11 +211,12 @@ impl AppDatabase {
         self.connection.execute(
             "
             INSERT INTO resume_state (
-                session_id, runtime_thread_id, saved_at, active_mode, active_question_id, focused_panel, draft_payload, scratchpad_text
+                session_id, runtime_thread_id, active_course, saved_at, active_mode, active_question_id, focused_panel, draft_payload, scratchpad_text
             )
-            VALUES (?1, ?2, datetime('now'), ?3, ?4, ?5, ?6, ?7)
+            VALUES (?1, ?2, ?3, datetime('now'), ?4, ?5, ?6, ?7, ?8)
             ON CONFLICT(session_id) DO UPDATE SET
                 runtime_thread_id = excluded.runtime_thread_id,
+                active_course = excluded.active_course,
                 saved_at = excluded.saved_at,
                 active_mode = excluded.active_mode,
                 active_question_id = excluded.active_question_id,
@@ -200,6 +227,7 @@ impl AppDatabase {
             params![
                 record.session_id,
                 record.runtime_thread_id,
+                record.active_course,
                 record.active_mode,
                 record.active_question_id,
                 record.focused_panel,
@@ -210,14 +238,65 @@ impl AppDatabase {
         Ok(())
     }
 
+    pub fn load_course_runtime_thread(&self, course: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "
+                SELECT runtime_thread_id
+                FROM course_runtime_threads
+                WHERE course = ?1
+                ",
+                params![course],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn save_course_runtime_thread(
+        &self,
+        course: &str,
+        runtime_thread_id: Option<&str>,
+    ) -> Result<()> {
+        match runtime_thread_id {
+            Some(thread_id) => {
+                self.connection.execute(
+                    "
+                    INSERT INTO course_runtime_threads (course, runtime_thread_id, updated_at)
+                    VALUES (?1, ?2, datetime('now'))
+                    ON CONFLICT(course) DO UPDATE SET
+                        runtime_thread_id = excluded.runtime_thread_id,
+                        updated_at = excluded.updated_at
+                    ",
+                    params![course, thread_id],
+                )?;
+            }
+            None => {
+                self.connection.execute(
+                    "
+                    DELETE FROM course_runtime_threads
+                    WHERE course = ?1
+                    ",
+                    params![course],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn start_session(&self, record: &SessionRecord) -> Result<()> {
         self.connection.execute(
             "
-            INSERT INTO sessions (id, started_at, planned_minutes, mode)
-            VALUES (?1, datetime('now'), ?2, ?3)
+            INSERT INTO sessions (id, started_at, planned_minutes, mode, course)
+            VALUES (?1, datetime('now'), ?2, ?3, ?4)
             ON CONFLICT(id) DO NOTHING
             ",
-            params![record.id, record.planned_minutes, record.mode],
+            params![
+                record.id,
+                record.planned_minutes,
+                record.mode,
+                record.course
+            ],
         )?;
         Ok(())
     }
@@ -388,6 +467,43 @@ impl AppDatabase {
         Ok(summaries)
     }
 
+    pub fn list_due_reviews_for_course(
+        &self,
+        course: &str,
+        limit: usize,
+    ) -> Result<Vec<DueReviewSummary>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT concepts.id, concepts.name, concept_state.next_review_at
+            FROM concept_state
+            INNER JOIN concepts ON concepts.id = concept_state.concept_id
+            WHERE concept_state.next_review_at IS NOT NULL
+              AND concepts.course = ?1
+            ORDER BY
+                CASE
+                    WHEN concept_state.next_review_at <= datetime('now') THEN 0
+                    ELSE 1
+                END,
+                concept_state.next_review_at ASC
+            LIMIT ?2
+            ",
+        )?;
+
+        let rows = statement.query_map(params![course, limit as i64], |row| {
+            Ok(DueReviewSummary {
+                concept_id: row.get(0)?,
+                concept_name: row.get(1)?,
+                next_review_at: row.get(2)?,
+            })
+        })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
     pub fn list_recent_misconceptions(&self, limit: usize) -> Result<Vec<MisconceptionSummary>> {
         let mut statement = self.connection.prepare(
             "
@@ -402,6 +518,42 @@ impl AppDatabase {
         )?;
 
         let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(MisconceptionSummary {
+                concept_name: row.get(0)?,
+                error_type: row.get(1)?,
+                description: row.get(2)?,
+                last_seen_at: row.get(3)?,
+                evidence_count: row.get::<_, i64>(4)? as usize,
+                status: "confirmed".to_string(),
+            })
+        })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
+    pub fn list_recent_misconceptions_for_course(
+        &self,
+        course: &str,
+        limit: usize,
+    ) -> Result<Vec<MisconceptionSummary>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT concepts.name, misconceptions.error_type, misconceptions.description,
+                   misconceptions.last_seen_at, misconceptions.evidence_count
+            FROM misconceptions
+            INNER JOIN concepts ON concepts.id = misconceptions.concept_id
+            WHERE misconceptions.resolved_at IS NULL
+              AND concepts.course = ?1
+            ORDER BY misconceptions.last_seen_at DESC
+            LIMIT ?2
+            ",
+        )?;
+
+        let rows = statement.query_map(params![course, limit as i64], |row| {
             Ok(MisconceptionSummary {
                 concept_name: row.get(0)?,
                 error_type: row.get(1)?,
@@ -467,18 +619,74 @@ impl AppDatabase {
         Ok(summaries)
     }
 
-    pub fn latest_session_recap(&self) -> Result<Option<SessionRecapSummary>> {
+    pub fn list_recent_repair_signals_for_course(
+        &self,
+        course: &str,
+        limit: usize,
+    ) -> Result<Vec<MisconceptionSummary>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT concept_name, error_type, description, last_seen_at, evidence_count, status
+            FROM (
+                SELECT concepts.name AS concept_name,
+                       misconceptions.error_type AS error_type,
+                       misconceptions.description AS description,
+                       misconceptions.last_seen_at AS last_seen_at,
+                       misconceptions.evidence_count AS evidence_count,
+                       'confirmed' AS status
+                FROM misconceptions
+                INNER JOIN concepts ON concepts.id = misconceptions.concept_id
+                WHERE misconceptions.resolved_at IS NULL
+                  AND concepts.course = ?1
+                UNION ALL
+                SELECT concepts.name AS concept_name,
+                       misconception_candidates.error_type AS error_type,
+                       misconception_candidates.description AS description,
+                       misconception_candidates.last_seen_at AS last_seen_at,
+                       misconception_candidates.evidence_count AS evidence_count,
+                       'candidate' AS status
+                FROM misconception_candidates
+                INNER JOIN concepts ON concepts.id = misconception_candidates.concept_id
+                WHERE misconception_candidates.status = 'pending'
+                  AND concepts.course = ?1
+            )
+            ORDER BY last_seen_at DESC
+            LIMIT ?2
+            ",
+        )?;
+
+        let rows = statement.query_map(params![course, limit as i64], |row| {
+            Ok(MisconceptionSummary {
+                concept_name: row.get(0)?,
+                error_type: row.get(1)?,
+                description: row.get(2)?,
+                last_seen_at: row.get(3)?,
+                evidence_count: row.get::<_, i64>(4)? as usize,
+                status: row.get(5)?,
+            })
+        })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
+    pub fn latest_session_recap(&self, course: &str) -> Result<Option<SessionRecapSummary>> {
         let recap = self
             .connection
             .query_row(
                 "
                 SELECT recap_payload
                 FROM sessions
-                WHERE recap_payload IS NOT NULL AND recap_payload != ''
+                WHERE recap_payload IS NOT NULL
+                  AND recap_payload != ''
+                  AND course = ?1
                 ORDER BY started_at DESC
                 LIMIT 1
                 ",
-                [],
+                params![course],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -545,8 +753,18 @@ impl AppDatabase {
             if self.table_exists("misconception_candidates")?
                 && self.table_exists("misconception_decisions")?
             {
-                self.set_schema_version(LATEST_SCHEMA_VERSION)?;
-                return Ok(LATEST_SCHEMA_VERSION);
+                if self.column_exists("resume_state", "active_course")?
+                    && self.table_exists("course_runtime_threads")?
+                {
+                    if self.column_exists("sessions", "course")? {
+                        self.set_schema_version(LATEST_SCHEMA_VERSION)?;
+                        return Ok(LATEST_SCHEMA_VERSION);
+                    }
+                    self.set_schema_version(4)?;
+                    return Ok(4);
+                }
+                self.set_schema_version(3)?;
+                return Ok(3);
             }
             self.set_schema_version(2)?;
             return Ok(2);
@@ -1016,6 +1234,7 @@ mod tests {
             let record = ResumeStateRecord {
                 session_id: "test-session".to_string(),
                 runtime_thread_id: Some("runtime-thread".to_string()),
+                active_course: "Matrix Algebra & Linear Models".to_string(),
                 active_mode: "Study".to_string(),
                 active_question_id: Some("4".to_string()),
                 focused_panel: "Scratchpad".to_string(),
@@ -1034,8 +1253,49 @@ mod tests {
 
             assert_eq!(loaded.session_id, record.session_id);
             assert_eq!(loaded.runtime_thread_id, record.runtime_thread_id);
+            assert_eq!(loaded.active_course, record.active_course);
             assert_eq!(loaded.focused_panel, record.focused_panel);
             assert_eq!(loaded.scratchpad_text, record.scratchpad_text);
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn course_runtime_threads_round_trip_per_course() {
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        {
+            let database = AppDatabase::open(&path)
+                .unwrap_or_else(|err| panic!("database open failed: {err}"));
+
+            database
+                .save_course_runtime_thread("Matrix Algebra & Linear Models", Some("thread-matrix"))
+                .unwrap_or_else(|err| panic!("save matrix thread failed: {err}"));
+            database
+                .save_course_runtime_thread(
+                    "Probability & Statistics for Scientists",
+                    Some("thread-probability"),
+                )
+                .unwrap_or_else(|err| panic!("save probability thread failed: {err}"));
+
+            let matrix = database
+                .load_course_runtime_thread("Matrix Algebra & Linear Models")
+                .unwrap_or_else(|err| panic!("load matrix thread failed: {err}"));
+            let probability = database
+                .load_course_runtime_thread("Probability & Statistics for Scientists")
+                .unwrap_or_else(|err| panic!("load probability thread failed: {err}"));
+
+            assert_eq!(matrix.as_deref(), Some("thread-matrix"));
+            assert_eq!(probability.as_deref(), Some("thread-probability"));
+
+            database
+                .save_course_runtime_thread("Matrix Algebra & Linear Models", None)
+                .unwrap_or_else(|err| panic!("delete matrix thread failed: {err}"));
+            let deleted = database
+                .load_course_runtime_thread("Matrix Algebra & Linear Models")
+                .unwrap_or_else(|err| panic!("reload deleted thread failed: {err}"));
+            assert!(deleted.is_none());
         }
 
         let _ = fs::remove_dir_all(dir);
@@ -1054,6 +1314,7 @@ mod tests {
                     id: "session-1".to_string(),
                     planned_minutes: 45,
                     mode: "Study".to_string(),
+                    course: "Matrix Algebra & Linear Models".to_string(),
                 })
                 .unwrap_or_else(|err| panic!("session start failed: {err}"));
 
@@ -1105,6 +1366,73 @@ mod tests {
     }
 
     #[test]
+    fn course_scoped_review_and_repair_queries_do_not_leak_between_courses() {
+        let dir = temp_db_dir();
+        let path = dir.join("studyos.db");
+        {
+            let database = AppDatabase::open(&path)
+                .unwrap_or_else(|err| panic!("database open failed: {err}"));
+
+            database
+                .start_session(&SessionRecord {
+                    id: "session-1".to_string(),
+                    planned_minutes: 45,
+                    mode: "Study".to_string(),
+                    course: "Matrix Algebra & Linear Models".to_string(),
+                })
+                .unwrap_or_else(|err| panic!("session start failed: {err}"));
+
+            database
+                .record_attempt(
+                    &AttemptRecord {
+                        id: "attempt-1".to_string(),
+                        session_id: "session-1".to_string(),
+                        concept_id: "matrix_multiplication_dims".to_string(),
+                        question_type: "retrieval_response".to_string(),
+                        prompt_hash: "abc123".to_string(),
+                        student_answer: "rows and columns mismatched".to_string(),
+                        correctness: "incorrect".to_string(),
+                        latency_ms: 1200,
+                        reasoning_quality: "missing".to_string(),
+                        feedback_summary: "You mixed up inner and outer dimensions.".to_string(),
+                    },
+                    Some(&MisconceptionInput {
+                        concept_id: "matrix_multiplication_dims".to_string(),
+                        error_type: "conceptual_misunderstanding".to_string(),
+                        description: "Confused inner and outer dimensions.".to_string(),
+                    }),
+                )
+                .unwrap_or_else(|err| panic!("attempt record failed: {err}"));
+
+            let matrix_reviews = database
+                .list_due_reviews_for_course("Matrix Algebra & Linear Models", 5)
+                .unwrap_or_else(|err| panic!("matrix due review query failed: {err}"));
+            let probability_reviews = database
+                .list_due_reviews_for_course("Probability & Statistics for Scientists", 5)
+                .unwrap_or_else(|err| panic!("probability due review query failed: {err}"));
+            let matrix_repair = database
+                .list_recent_repair_signals_for_course("Matrix Algebra & Linear Models", 5)
+                .unwrap_or_else(|err| panic!("matrix repair signal query failed: {err}"));
+            let probability_repair = database
+                .list_recent_repair_signals_for_course("Probability & Statistics for Scientists", 5)
+                .unwrap_or_else(|err| panic!("probability repair signal query failed: {err}"));
+
+            assert_eq!(matrix_reviews.len(), 1);
+            assert!(probability_reviews.is_empty());
+            assert_eq!(matrix_repair.len(), 1);
+            assert!(probability_repair.is_empty());
+            assert_eq!(
+                database
+                    .due_review_count_for_course("Probability & Statistics for Scientists")
+                    .unwrap_or_else(|err| panic!("probability due review count failed: {err}")),
+                0
+            );
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn session_recap_round_trips() {
         let dir = temp_db_dir();
         let path = dir.join("studyos.db");
@@ -1117,6 +1445,7 @@ mod tests {
                     id: "session-recap".to_string(),
                     planned_minutes: 30,
                     mode: "Study".to_string(),
+                    course: "Matrix Algebra & Linear Models".to_string(),
                 })
                 .unwrap_or_else(|err| panic!("session start failed: {err}"));
 
@@ -1138,7 +1467,7 @@ mod tests {
                 .unwrap_or_else(|err| panic!("save recap failed: {err}"));
 
             let loaded = database
-                .latest_session_recap()
+                .latest_session_recap("Matrix Algebra & Linear Models")
                 .unwrap_or_else(|err| panic!("load recap failed: {err}"))
                 .unwrap_or_else(|| panic!("missing recap"));
 
@@ -1159,6 +1488,7 @@ mod tests {
                 id: "session-1".to_string(),
                 planned_minutes: 30,
                 mode: "Study".to_string(),
+                course: "Matrix Algebra & Linear Models".to_string(),
             })
             .unwrap_or_else(|err| panic!("session start failed: {err}"));
 
@@ -1212,6 +1542,7 @@ mod tests {
                 id: "session-1".to_string(),
                 planned_minutes: 30,
                 mode: "Study".to_string(),
+                course: "Matrix Algebra & Linear Models".to_string(),
             })
             .unwrap_or_else(|err| panic!("session start failed: {err}"));
 

@@ -154,6 +154,12 @@ Write runtime JSONL traces under `.studyos/logs/` for debugging:
 cargo run -p studyos-cli -- --log-json
 ```
 
+Run the internal alpha-readiness harness against the live runtime:
+
+```bash
+STUDYOS_CODEX_AVAILABLE=1 cargo run -p studyos-cli --example alpha_readiness
+```
+
 Manage local deadlines without hand-editing JSON:
 
 ```bash

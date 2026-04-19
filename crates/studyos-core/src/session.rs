@@ -440,10 +440,22 @@ fn choose_start_mode(
         .recent_misconceptions
         .iter()
         .any(|item| item.error_type == "conceptual_misunderstanding");
+    let unfinished_repair = study_context
+        .last_session_recap
+        .as_ref()
+        .map(|recap| !recap.unfinished_objectives.is_empty())
+        .unwrap_or(false);
+    let deadline_run_up = study_context
+        .study_window
+        .as_ref()
+        .map(|window| matches!(window.source, WindowSource::BeforeDeadline))
+        .unwrap_or(false);
 
-    if stats.due_reviews >= 2 || repeated_repairs {
+    if stats.due_reviews >= 2 || repeated_repairs || unfinished_repair {
         SessionMode::Review
-    } else if matches!(urgency, DeadlineUrgency::Urgent) && stats.total_attempts > 0 {
+    } else if (matches!(urgency, DeadlineUrgency::Urgent) || deadline_run_up)
+        && stats.total_attempts > 0
+    {
         SessionMode::Drill
     } else {
         SessionMode::Study
@@ -472,7 +484,15 @@ fn build_start_plan(
         SessionMode::Review => SessionPlanSummary {
             recommended_duration_minutes: recommended_duration_minutes.min(35),
             window: study_context.study_window.clone(),
-            why_now: if !study_context.recent_misconceptions.is_empty() {
+            why_now: if let Some(objective) = study_context
+                .last_session_recap
+                .as_ref()
+                .and_then(|recap| recap.unfinished_objectives.first())
+            {
+                format!(
+                    "{window_prefix}You stopped with unfinished repair work, so restart by stabilizing: {objective}"
+                )
+            } else if !study_context.recent_misconceptions.is_empty() {
                 format!(
                     "{window_prefix}You have active repair work to revisit, starting with {}.",
                     study_context.recent_misconceptions[0].concept_name
@@ -483,10 +503,17 @@ fn build_start_plan(
                 )
             },
             warm_up_questions: study_context
-                .due_reviews
-                .iter()
-                .take(2)
-                .map(|item| format!("Retrieve the key rule for {}.", item.concept_name))
+                .last_session_recap
+                .as_ref()
+                .and_then(|recap| recap.unfinished_objectives.first().cloned())
+                .into_iter()
+                .chain(
+                    study_context
+                        .due_reviews
+                        .iter()
+                        .take(2)
+                        .map(|item| format!("Retrieve the key rule for {}.", item.concept_name)),
+                )
                 .chain(
                     study_context
                         .recent_misconceptions
@@ -496,10 +523,18 @@ fn build_start_plan(
                 )
                 .collect(),
             core_targets: study_context
-                .due_reviews
-                .iter()
-                .take(3)
-                .map(|item| item.concept_name.clone())
+                .last_session_recap
+                .as_ref()
+                .map(|recap| recap.weak_concepts.iter().take(1).cloned())
+                .into_iter()
+                .flatten()
+                .chain(
+                    study_context
+                        .due_reviews
+                        .iter()
+                        .take(3)
+                        .map(|item| item.concept_name.clone()),
+                )
                 .collect(),
             stretch_target: Some(
                 "Only move on if the repair question is genuinely secure.".to_string(),
@@ -659,15 +694,35 @@ mod tests {
             },
         );
 
-        assert_eq!(snapshot.mode, SessionMode::Study);
+        assert_eq!(snapshot.mode, SessionMode::Review);
         assert!(
-            snapshot.plan.why_now.contains("unfinished work"),
-            "expected why_now to mention unfinished work"
+            snapshot.plan.why_now.contains("unfinished repair work"),
+            "expected why_now to mention unfinished repair work"
         );
         assert_eq!(
             snapshot.plan.warm_up_questions[0],
             "Rebuild the inner-dimension rule for matrix multiplication."
         );
+    }
+
+    #[test]
+    fn bootstrap_routes_to_drill_for_deadline_run_up_window() {
+        let config = AppConfig::default();
+        let snapshot = AppSnapshot::bootstrap(
+            &config,
+            &stats(0, 1, 2),
+            &BootstrapStudyContext {
+                study_window: Some(StudyWindow {
+                    start: "2026-04-19T16:00:00Z".to_string(),
+                    duration_minutes: 45,
+                    source: WindowSource::BeforeDeadline,
+                }),
+                ..BootstrapStudyContext::default()
+            },
+        );
+
+        assert_eq!(snapshot.mode, SessionMode::Drill);
+        assert_eq!(snapshot.panel_tab, PanelTab::Deadlines);
     }
 
     #[test]

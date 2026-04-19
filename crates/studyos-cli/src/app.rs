@@ -144,6 +144,10 @@ impl App {
             resume_state,
         } = bootstrap;
 
+        let saved_course_thread = database
+            .load_course_runtime_thread(&snapshot.course)
+            .unwrap_or(None);
+
         let question_indices = Self::question_indices_from(&snapshot.transcript);
         let active_question_index = *question_indices.first().unwrap_or(&0);
 
@@ -179,7 +183,7 @@ impl App {
             active_question_index,
             runtime,
             runtime_factory,
-            runtime_thread_id: None,
+            runtime_thread_id: saved_course_thread,
             runtime_ready: false,
             runtime_disconnected: false,
             runtime_bootstrap_applied: false,
@@ -475,6 +479,9 @@ impl App {
     }
 
     pub fn active_widget(&self) -> Option<&ResponseWidget> {
+        if !self.live_runtime_question_ready() {
+            return None;
+        }
         self.widget_states.get(&self.active_question_index)
     }
 
@@ -498,6 +505,9 @@ impl App {
     }
 
     pub fn active_widget_mut(&mut self) -> Option<&mut ResponseWidget> {
+        if !self.live_runtime_question_ready() {
+            return None;
+        }
         self.widget_states.get_mut(&self.active_question_index)
     }
 
@@ -507,6 +517,7 @@ impl App {
         let record = ResumeStateRecord {
             session_id: "study-session".to_string(),
             runtime_thread_id: self.runtime_thread_id.clone(),
+            active_course: self.snapshot.course.clone(),
             active_mode: self.snapshot.mode.label().to_string(),
             active_question_id: Some(self.active_question_index.to_string()),
             focused_panel: self.snapshot.panel_tab.label().to_string(),
@@ -514,7 +525,9 @@ impl App {
             scratchpad_text: self.snapshot.scratchpad.clone(),
         };
 
-        self.database.save_resume_state(&record)
+        self.database.save_resume_state(&record)?;
+        self.database
+            .save_course_runtime_thread(&self.snapshot.course, self.runtime_thread_id.as_deref())
     }
 
     pub fn active_question_title(&self) -> String {
@@ -539,12 +552,17 @@ impl App {
     }
 
     pub fn question_indices(&self) -> Vec<usize> {
+        if !self.live_runtime_question_ready() {
+            return Vec::new();
+        }
         Self::question_indices_from(&self.snapshot.transcript)
     }
 
     pub fn status_line(&self) -> String {
         let runtime_label = if self.runtime_disconnected {
             "App-server disconnected"
+        } else if self.runtime.is_some() && !self.runtime_bootstrap_applied {
+            "Waiting for live tutor question"
         } else if self.runtime_ready {
             "App-server connected"
         } else if self.runtime.is_some() {
@@ -574,7 +592,10 @@ impl App {
     }
 
     pub fn misconceptions_summary(&self) -> Vec<String> {
-        match self.database.list_recent_repair_signals(4) {
+        match self
+            .database
+            .list_recent_repair_signals_for_course(&self.snapshot.course, 4)
+        {
             Ok(entries) if !entries.is_empty() => {
                 let mut lines = vec!["Recent repair signals:".to_string()];
                 for entry in entries {
@@ -594,7 +615,10 @@ impl App {
     }
 
     pub fn review_summary(&self) -> Vec<String> {
-        match self.database.list_due_reviews(4) {
+        match self
+            .database
+            .list_due_reviews_for_course(&self.snapshot.course, 4)
+        {
             Ok(reviews) if !reviews.is_empty() => {
                 let mut lines = vec![format!(
                     "Due review count: {}",
@@ -674,7 +698,7 @@ impl App {
     fn fallback_session_recap(&self) -> SessionRecapSummary {
         let mut weak_concepts = self
             .database
-            .list_recent_repair_signals(3)
+            .list_recent_repair_signals_for_course(&self.snapshot.course, 3)
             .unwrap_or_default()
             .into_iter()
             .map(|item| item.concept_name)
@@ -694,7 +718,7 @@ impl App {
             },
             demonstrated_concepts: self
                 .database
-                .list_due_reviews(3)
+                .list_due_reviews_for_course(&self.snapshot.course, 3)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|item| item.concept_name)
@@ -702,7 +726,7 @@ impl App {
             weak_concepts,
             next_review_items: self
                 .database
-                .list_due_reviews(3)
+                .list_due_reviews_for_course(&self.snapshot.course, 3)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|item| format!("{} at {}", item.concept_name, item.next_review_at))
@@ -716,13 +740,23 @@ impl App {
             id: self.current_session_id.clone(),
             planned_minutes: self.snapshot.time_remaining_minutes,
             mode: self.snapshot.mode.label().to_string(),
+            course: self.snapshot.course.clone(),
         };
         self.database.start_session(&record)
     }
 
+    fn live_runtime_question_ready(&self) -> bool {
+        self.runtime.is_none() || self.runtime_bootstrap_applied
+    }
+
     fn refresh_snapshot_metrics(&mut self) -> Result<()> {
         let mut stats = self.database.stats()?;
-        stats.upcoming_deadlines = self.local_context.upcoming_deadline_count();
+        stats.due_reviews = self
+            .database
+            .due_review_count_for_course(&self.snapshot.course)?;
+        stats.upcoming_deadlines = self
+            .local_context
+            .upcoming_deadline_count_for_course(&self.snapshot.course);
         self.stats = stats.clone();
         self.snapshot.metrics.due_reviews = stats.due_reviews;
         self.snapshot.metrics.upcoming_deadlines = stats.upcoming_deadlines;
@@ -914,7 +948,7 @@ impl App {
             .join(", ");
         let due_review_concepts = self
             .database
-            .list_due_reviews(3)
+            .list_due_reviews_for_course(&self.snapshot.course, 3)
             .unwrap_or_default()
             .into_iter()
             .map(|review| review.concept_name)
@@ -922,7 +956,7 @@ impl App {
             .join(", ");
         let misconceptions = self
             .database
-            .list_recent_repair_signals(3)
+            .list_recent_repair_signals_for_course(&self.snapshot.course, 3)
             .unwrap_or_default()
             .into_iter()
             .map(|item| {
@@ -935,13 +969,13 @@ impl App {
             .join("; ");
         let material_terms = self
             .database
-            .list_due_reviews(3)
+            .list_due_reviews_for_course(&self.snapshot.course, 3)
             .unwrap_or_default()
             .into_iter()
             .map(|review| review.concept_name)
             .chain(
                 self.database
-                    .list_recent_repair_signals(3)
+                    .list_recent_repair_signals_for_course(&self.snapshot.course, 3)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|item| item.concept_name),
@@ -1073,7 +1107,7 @@ impl App {
         };
         let due_reviews = self
             .database
-            .list_due_reviews(4)
+            .list_due_reviews_for_course(&self.snapshot.course, 4)
             .unwrap_or_default()
             .into_iter()
             .map(|item| format!("{} due {}", item.concept_name, item.next_review_at))
@@ -1081,7 +1115,7 @@ impl App {
             .join("; ");
         let misconceptions = self
             .database
-            .list_recent_repair_signals(4)
+            .list_recent_repair_signals_for_course(&self.snapshot.course, 4)
             .unwrap_or_default()
             .into_iter()
             .map(|item| {
@@ -1866,6 +1900,18 @@ impl App {
     }
 
     fn apply_resume_state(&mut self, resume: ResumeStateRecord) {
+        if resume.active_course != self.snapshot.course {
+            self.set_activity(
+                "Resume",
+                format!(
+                    "Skipped draft/UI resume from `{}` while starting `{}`.",
+                    resume.active_course, self.snapshot.course
+                ),
+                ActivityStatus::Healthy,
+            );
+            return;
+        }
+
         self.runtime_thread_id = resume.runtime_thread_id;
         self.snapshot.mode = SessionMode::from_label(&resume.active_mode);
         self.snapshot.panel_tab = PanelTab::from_label(&resume.focused_panel);
@@ -3116,6 +3162,72 @@ mod tests {
     }
 
     #[test]
+    fn runtime_bootstrap_hides_placeholder_widget_until_live_payload_arrives() {
+        let base = temp_data_root();
+        let paths = AppPaths::discover(&base);
+        paths
+            .ensure()
+            .unwrap_or_else(|err| panic!("path ensure failed: {err}"));
+        let database = AppDatabase::open(&paths.database_path)
+            .unwrap_or_else(|err| panic!("database open failed: {err}"));
+        let config = AppConfig::default();
+        let stats = database
+            .stats()
+            .unwrap_or_else(|err| panic!("stats query failed: {err}"));
+        let snapshot = AppSnapshot::bootstrap(&config, &stats, &BootstrapStudyContext::default());
+        let mut app = App::new(AppBootstrap {
+            database,
+            paths: paths.clone(),
+            config,
+            stats,
+            local_context: LocalContext::default(),
+            snapshot,
+            runtime: Some(Arc::new(NoopTransport)),
+            runtime_factory: Some(Arc::new(|| Ok(Arc::new(NoopTransport)))),
+            runtime_error: None,
+            resume_state: None,
+        });
+
+        assert!(app.active_widget().is_none());
+        assert!(app.question_indices().is_empty());
+        assert!(
+            app.status_line()
+                .contains("Waiting for live tutor question")
+        );
+
+        let payload = TutorTurnPayload {
+            session_plan: Some(SessionPlanSummary {
+                recommended_duration_minutes: 10,
+                window: None,
+                why_now: "Runtime bootstrapped.".to_string(),
+                warm_up_questions: vec!["When is AB defined?".to_string()],
+                core_targets: vec!["Matrix multiplication".to_string()],
+                stretch_target: None,
+            }),
+            teaching_blocks: vec![TutorBlock::Paragraph {
+                text: "Live tutor question arrived.".to_string(),
+            }],
+            question: Some(TutorQuestion {
+                title: "Live Question".to_string(),
+                prompt: "Fill the 2 by 2 product.".to_string(),
+                concept_tags: vec!["matrix_multiplication".to_string()],
+                widget_kind: ResponseWidgetKind::MatrixGrid,
+                matrix_dimensions: Some(MatrixDimensions { rows: 2, cols: 2 }),
+            }),
+            evaluation: None,
+        };
+
+        let raw = serde_json::to_string(&payload)
+            .unwrap_or_else(|err| panic!("payload serialization failed: {err}"));
+        app.apply_structured_tutor_payload("turn-live", &raw);
+
+        assert!(app.active_widget().is_some());
+        assert!(!app.question_indices().is_empty());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn disconnect_persists_resume_and_blocks_submission() {
         let base = temp_data_root();
         let paths = AppPaths::discover(&base);
@@ -3142,6 +3254,7 @@ mod tests {
             resume_state: None,
         });
         app.runtime_ready = true;
+        app.runtime_bootstrap_applied = true;
         app.runtime_thread_id = Some("thread-test".to_string());
         if let Some(ResponseWidget::MatrixGrid(state)) = app.active_widget_mut() {
             state.cells[0][0] = "9".to_string();
